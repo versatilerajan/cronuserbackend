@@ -6,10 +6,7 @@ const helmet = require("helmet");
 const compression = require("compression");
 const rateLimit = require("express-rate-limit");
 const admin = require("firebase-admin");
-
 const app = express();
-
-// ================= SECURITY =================
 app.use(express.json({ limit: "10kb" }));
 app.use(cors());
 app.use(helmet());
@@ -20,10 +17,7 @@ app.use(
     max: 500
   })
 );
-
-// ================= DATABASE (SERVERLESS SAFE) =================
 let cached = global.mongoose;
-
 if (!cached) {
   cached = global.mongoose = { conn: null, promise: null };
 }
@@ -41,8 +35,6 @@ async function connectDB() {
   cached.conn = await cached.promise;
   return cached.conn;
 }
-
-// ================= FIREBASE INIT =================
 if (!admin.apps.length) {
   try {
     admin.initializeApp({
@@ -53,8 +45,6 @@ if (!admin.apps.length) {
     console.error("Firebase init error:", err.message);
   }
 }
-
-// ================= SCHEMAS =================
 const testSchema = new mongoose.Schema({
   title: String,
   date: String,
@@ -89,8 +79,6 @@ resultSchema.index({ testId: 1, score: -1 });
 const Test = mongoose.models.Test || mongoose.model("Test", testSchema);
 const Question = mongoose.models.Question || mongoose.model("Question", questionSchema);
 const Result = mongoose.models.Result || mongoose.model("Result", resultSchema);
-
-// ================= FIREBASE AUTH =================
 const userAuth = async (req, res, next) => {
   const authHeader = req.headers.authorization;
 
@@ -106,30 +94,19 @@ const userAuth = async (req, res, next) => {
     return res.status(401).json({ message: "Invalid Firebase token" });
   }
 };
-
-// ================= ROUTES =================
 app.get("/", (req, res) => {
   res.json({ status: "User Backend Running" });
 });
-
-// GET TODAY TEST (HYBRID 24 HRS)
 app.get("/user/today-test", userAuth, async (req, res) => {
   await connectDB();
-
   const today = new Date().toISOString().split("T")[0];
   const test = await Test.findOne({ date: today });
-
   if (!test) return res.status(404).json({ message: "No test today" });
-
   const now = new Date();
-
-  // Hybrid: 24 hr access
   if (now < test.startTime) {
     return res.json({ status: "not_started" });
   }
-
   const questions = await Question.find({ testId: test._id }).select("-correctOption");
-
   res.json({
     status: "active",
     testId: test._id,
@@ -138,8 +115,6 @@ app.get("/user/today-test", userAuth, async (req, res) => {
     questions
   });
 });
-
-// SUBMIT TEST
 app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
   await connectDB();
   const { answers } = req.body;
@@ -180,8 +155,6 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
     rank
   });
 });
-
-// LEADERBOARD
 app.get("/user/leaderboard/:testId", async (req, res) => {
   await connectDB();
   const topUsers = await Result.find({ testId: req.params.testId })
@@ -190,10 +163,8 @@ app.get("/user/leaderboard/:testId", async (req, res) => {
   res.json(topUsers);
 });
 
-// ================= LOCAL TEST =================
 if (process.env.NODE_ENV !== "production") {
   const PORT = process.env.PORT || 5000;
   app.listen(PORT, () => console.log(`User Backend Running on ${PORT}`));
 }
-
 module.exports = app;
