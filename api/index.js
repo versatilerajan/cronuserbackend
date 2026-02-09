@@ -8,8 +8,6 @@ const rateLimit = require("express-rate-limit");
 const admin = require("firebase-admin");
 
 const app = express();
-
-// ================= SECURITY & MIDDLEWARE =================
 app.use(express.json({ limit: "10kb" }));
 
 app.use(cors({
@@ -20,7 +18,8 @@ app.use(cors({
   optionsSuccessStatus: 204
 }));
 
-app.options("*", (req, res) => {
+// FIXED: Use regex wildcard instead of bare "*" (prevents path-to-regexp crash)
+app.options(/.*/, (req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -89,7 +88,7 @@ if (!admin.apps.length) {
   } catch (err) {
     console.error("Firebase Admin Initialization FAILED:", err.message);
     console.error("Stack:", err.stack?.substring(0, 300) || "no stack");
-    // Do NOT crash the whole function – continue without Firebase
+    // Continue without crashing the function
   }
 }
 
@@ -129,7 +128,7 @@ const Test = mongoose.models.Test || mongoose.model("Test", testSchema);
 const Question = mongoose.models.Question || mongoose.model("Question", questionSchema);
 const Result = mongoose.models.Result || mongoose.model("Result", resultSchema);
 
-// ================= AUTH MIDDLEWARE – SAFE FALLBACK =================
+// ================= AUTH MIDDLEWARE =================
 const userAuth = async (req, res, next) => {
   if (!firebaseInitialized) {
     return res.status(503).json({ message: "Firebase Auth not initialized – server misconfigured" });
@@ -155,7 +154,7 @@ app.get("/", (req, res) => {
   res.json({
     status: "User Backend Running",
     firebaseReady: firebaseInitialized,
-    mongoReady: mongoose.connection.readyState >= 1
+    mongoReady: mongoose.connection.readyState >= 1 ? "connected" : "not connected"
   });
 });
 
@@ -232,5 +231,4 @@ app.get("/user/leaderboard/:testId", async (req, res) => {
   }
 });
 
-// ================= EXPORT =================
 module.exports = app;
