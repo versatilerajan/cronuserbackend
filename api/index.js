@@ -8,6 +8,8 @@ const rateLimit = require("express-rate-limit");
 const admin = require("firebase-admin");
 
 const app = express();
+
+// ================= MIDDLEWARE =================
 app.use(express.json({ limit: "10kb" }));
 
 app.use(cors({
@@ -18,7 +20,6 @@ app.use(cors({
   optionsSuccessStatus: 204
 }));
 
-// Safe wildcard handling (regex instead of bare *)
 app.options(/.*/, (req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -72,18 +73,7 @@ if (!admin.apps.length) {
       throw new Error("FIREBASE_SERVICE_ACCOUNT is missing or empty");
     }
 
-    console.log("FIREBASE_SERVICE_ACCOUNT length:", raw.length);
-    console.log("FIREBASE_SERVICE_ACCOUNT first 50 chars:", raw.substring(0, 50));
-
-    let serviceAccount;
-    try {
-      serviceAccount = JSON.parse(raw);
-    } catch (parseErr) {
-      throw new Error(`JSON.parse failed on FIREBASE_SERVICE_ACCOUNT: ${parseErr.message}`);
-    }
-
-    console.log("Parsed project_id:", serviceAccount.project_id || "MISSING");
-    console.log("Parsed client_email:", serviceAccount.client_email || "MISSING");
+    let serviceAccount = JSON.parse(raw);
 
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount)
@@ -135,7 +125,7 @@ const Result = mongoose.models.Result || mongoose.model("Result", resultSchema);
 // ================= AUTH MIDDLEWARE =================
 const userAuth = async (req, res, next) => {
   if (!firebaseInitialized) {
-    return res.status(503).json({ message: "Firebase Auth service not available" });
+    return res.status(503).json({ message: "Authentication service not available" });
   }
 
   const authHeader = req.headers.authorization;
@@ -148,43 +138,66 @@ const userAuth = async (req, res, next) => {
     req.user = decoded;
     next();
   } catch (err) {
-    console.error("Token verification failed:", err.code || "unknown", err.message);
-    return res.status(401).json({ message: "Invalid Firebase token", error: err.message || err.code });
+    return res.status(401).json({ message: "Invalid Firebase token" });
   }
 };
 
 // ================= ROUTES =================
 app.get("/", async (req, res) => {
   try {
-    await connectDB(); // Force connection check
+    await connectDB();
     res.json({
       status: "User Backend Running",
       firebaseReady: firebaseInitialized,
-      mongoReady: mongoose.connection.readyState === 1 ? "connected" : "failed",
-      mongoState: mongoose.connection.readyState
+      mongoReady: mongoose.connection.readyState === 1 ? "connected" : "not connected"
     });
   } catch (err) {
-    console.error("Root route DB error:", err.message);
-    res.status(500).json({
-      status: "User Backend Running (DB issue)",
-      firebaseReady: firebaseInitialized,
-      mongoReady: "failed",
-      error: err.message || "MongoDB connection error"
-    });
+    res.status(500).json({ status: "Error", error: err.message });
   }
 });
 
-// GET TODAY TEST
+// GET TODAY TEST – using IST for comparison
 app.get("/user/today-test", userAuth, async (req, res) => {
   try {
     await connectDB();
+
     const today = new Date().toISOString().split("T")[0];
     const test = await Test.findOne({ date: today });
-    if (!test) return res.status(404).json({ message: "No test today" });
 
-    const now = new Date();
-    if (now < test.startTime) return res.json({ status: "not_started" });
+    if (!test) {
+      return res.status(404).json({ message: "No test today" });
+    }
 
+    // ─── IMPORTANT: Compare time in Indian Standard Time (IST = UTC+5:30) ───
+    const nowUTC = new Date();
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000; // 5 hours 30 minutes
+    const nowIST = new Date(nowUTC.getTime() + IST_OFFSET_MS);
+
+    const startTimeUTC = new Date(test.startTime);
+    const endTimeUTC = new Date(test.endTime);
+
+    // Convert stored UTC times to IST for comparison
+    const startTimeIST = new Date(startTimeUTC.getTime() + IST_OFFSET_MS);
+    const endTimeIST = new Date(endTimeUTC.getTime() + IST_OFFSET_MS);
+
+    if (nowIST < startTimeIST) {
+      return res.json({
+        status: "not_started",
+        title: test.title,
+        startTimeIST: startTimeIST.toISOString(),
+        message: "Test has not started yet. Please check back later."
+      });
+    }
+
+    if (nowIST > endTimeIST) {
+      return res.json({
+        status: "ended",
+        title: test.title,
+        message: "Today's test has ended."
+      });
+    }
+
+    // Test is active
     const questions = await Question.find({ testId: test._id }).select("-correctOption");
 
     res.json({
@@ -192,11 +205,14 @@ app.get("/user/today-test", userAuth, async (req, res) => {
       testId: test._id,
       title: test.title,
       totalQuestions: test.totalQuestions,
+      startTimeIST: startTimeIST.toISOString(),
+      endTimeIST: endTimeIST.toISOString(),
       questions
     });
+
   } catch (err) {
-    console.error("/today-test error:", err.message);
-    res.status(500).json({ message: "Server error", detail: err.message });
+    console.error("today-test error:", err.message);
+    res.status(500).json({ message: "Server error" });
   }
 });
 
@@ -205,16 +221,21 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
     const { answers } = req.body;
+
     const questions = await Question.find({ testId: req.params.testId });
     if (!questions.length) return res.status(404).json({ message: "Test not found" });
 
     let score = 0;
-    questions.forEach(q => {
+    questions.forEach((q) => {
       const userAnswer = answers.find(a => a.questionId === q._id.toString());
       if (userAnswer && userAnswer.selectedOption === q.correctOption) score++;
     });
 
-    const alreadySubmitted = await Result.findOne({ userId: req.user.uid, testId: req.params.testId });
+    const alreadySubmitted = await Result.findOne({
+      userId: req.user.uid,
+      testId: req.params.testId
+    });
+
     if (alreadySubmitted) return res.status(400).json({ message: "Already submitted" });
 
     await Result.create({
@@ -224,12 +245,19 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       totalQuestions: questions.length
     });
 
-    const rank = (await Result.countDocuments({ testId: req.params.testId, score: { $gt: score } })) + 1;
+    const rank = (await Result.countDocuments({
+      testId: req.params.testId,
+      score: { $gt: score }
+    })) + 1;
 
-    res.json({ score, totalQuestions: questions.length, rank });
+    res.json({
+      score,
+      totalQuestions: questions.length,
+      rank
+    });
   } catch (err) {
-    console.error("/submit-test error:", err.message);
-    res.status(500).json({ message: "Server error", detail: err.message });
+    console.error("submit-test error:", err.message);
+    res.status(500).json({ message: "Server error" });
   }
 });
 
@@ -242,8 +270,9 @@ app.get("/user/leaderboard/:testId", async (req, res) => {
       .limit(50);
     res.json(topUsers);
   } catch (err) {
-    console.error("/leaderboard error:", err.message);
-    res.status(500).json({ message: "Server error", detail: err.message });
+    console.error("leaderboard error:", err.message);
+    res.status(500).json({ message: "Server error" });
   }
 });
+
 module.exports = app;
