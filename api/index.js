@@ -18,7 +18,7 @@ app.use(cors({
   optionsSuccessStatus: 204
 }));
 
-// FIXED: Use regex wildcard instead of bare "*" (prevents path-to-regexp crash)
+// Safe wildcard handling (regex instead of bare *)
 app.options(/.*/, (req, res) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -38,13 +38,20 @@ async function connectDB() {
   if (cached.conn) return cached.conn;
 
   if (!cached.promise) {
-    cached.promise = mongoose.connect(process.env.MONGO_URI || "")
+    if (!process.env.MONGO_URI) {
+      throw new Error("MONGO_URI is missing in environment variables");
+    }
+
+    cached.promise = mongoose.connect(process.env.MONGO_URI, {
+      serverSelectionTimeoutMS: 15000,
+      connectTimeoutMS: 15000,
+    })
       .then(m => {
-        console.log("MongoDB connected");
+        console.log("MongoDB connected successfully");
         return m;
       })
       .catch(err => {
-        console.error("MongoDB connection failed:", err.message);
+        console.error("MongoDB connection FAILED:", err.message);
         cached.promise = null;
         throw err;
       });
@@ -54,7 +61,7 @@ async function connectDB() {
   return cached.conn;
 }
 
-// ================= FIREBASE INIT – SAFE & DEBUG =================
+// ================= FIREBASE INIT =================
 let firebaseInitialized = false;
 
 if (!admin.apps.length) {
@@ -62,7 +69,7 @@ if (!admin.apps.length) {
     const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
 
     if (!raw || raw.trim() === "") {
-      throw new Error("FIREBASE_SERVICE_ACCOUNT is missing or empty in env vars");
+      throw new Error("FIREBASE_SERVICE_ACCOUNT is missing or empty");
     }
 
     console.log("FIREBASE_SERVICE_ACCOUNT length:", raw.length);
@@ -72,12 +79,11 @@ if (!admin.apps.length) {
     try {
       serviceAccount = JSON.parse(raw);
     } catch (parseErr) {
-      throw new Error(`JSON.parse failed: ${parseErr.message}`);
+      throw new Error(`JSON.parse failed on FIREBASE_SERVICE_ACCOUNT: ${parseErr.message}`);
     }
 
-    console.log("Parsed service account → project_id:", serviceAccount.project_id || "MISSING");
-    console.log("Parsed service account → client_email:", serviceAccount.client_email || "MISSING");
-    console.log("Parsed service account → type:", serviceAccount.type || "MISSING");
+    console.log("Parsed project_id:", serviceAccount.project_id || "MISSING");
+    console.log("Parsed client_email:", serviceAccount.client_email || "MISSING");
 
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount)
@@ -87,8 +93,6 @@ if (!admin.apps.length) {
     console.log("Firebase Admin Initialized successfully");
   } catch (err) {
     console.error("Firebase Admin Initialization FAILED:", err.message);
-    console.error("Stack:", err.stack?.substring(0, 300) || "no stack");
-    // Continue without crashing the function
   }
 }
 
@@ -131,7 +135,7 @@ const Result = mongoose.models.Result || mongoose.model("Result", resultSchema);
 // ================= AUTH MIDDLEWARE =================
 const userAuth = async (req, res, next) => {
   if (!firebaseInitialized) {
-    return res.status(503).json({ message: "Firebase Auth not initialized – server misconfigured" });
+    return res.status(503).json({ message: "Firebase Auth service not available" });
   }
 
   const authHeader = req.headers.authorization;
@@ -150,12 +154,24 @@ const userAuth = async (req, res, next) => {
 };
 
 // ================= ROUTES =================
-app.get("/", (req, res) => {
-  res.json({
-    status: "User Backend Running",
-    firebaseReady: firebaseInitialized,
-    mongoReady: mongoose.connection.readyState >= 1 ? "connected" : "not connected"
-  });
+app.get("/", async (req, res) => {
+  try {
+    await connectDB(); // Force connection check
+    res.json({
+      status: "User Backend Running",
+      firebaseReady: firebaseInitialized,
+      mongoReady: mongoose.connection.readyState === 1 ? "connected" : "failed",
+      mongoState: mongoose.connection.readyState
+    });
+  } catch (err) {
+    console.error("Root route DB error:", err.message);
+    res.status(500).json({
+      status: "User Backend Running (DB issue)",
+      firebaseReady: firebaseInitialized,
+      mongoReady: "failed",
+      error: err.message || "MongoDB connection error"
+    });
+  }
 });
 
 // GET TODAY TEST
@@ -180,7 +196,7 @@ app.get("/user/today-test", userAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("/today-test error:", err.message);
-    res.status(500).json({ message: "Server error" });
+    res.status(500).json({ message: "Server error", detail: err.message });
   }
 });
 
@@ -213,7 +229,7 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
     res.json({ score, totalQuestions: questions.length, rank });
   } catch (err) {
     console.error("/submit-test error:", err.message);
-    res.status(500).json({ message: "Server error" });
+    res.status(500).json({ message: "Server error", detail: err.message });
   }
 });
 
@@ -227,8 +243,7 @@ app.get("/user/leaderboard/:testId", async (req, res) => {
     res.json(topUsers);
   } catch (err) {
     console.error("/leaderboard error:", err.message);
-    res.status(500).json({ message: "Server error" });
+    res.status(500).json({ message: "Server error", detail: err.message });
   }
 });
-
 module.exports = app;
