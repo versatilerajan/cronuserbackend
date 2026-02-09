@@ -142,14 +142,21 @@ const userAuth = async (req, res, next) => {
   }
 };
 
-// ================= ROUTES =================
 app.get("/", async (req, res) => {
   try {
     await connectDB();
+    
+    const today = new Date().toISOString().split("T")[0];
+    const testToday = await Test.findOne({ date: today });
+
     res.json({
       status: "User Backend Running",
       firebaseReady: firebaseInitialized,
-      mongoReady: mongoose.connection.readyState === 1 ? "connected" : "not connected"
+      mongoReady: mongoose.connection.readyState === 1 ? "connected" : "not connected",
+      currentServerDateUTC: today,
+      foundTestForToday: !!testToday,
+      foundTestDate: testToday ? testToday.date : null,
+      foundTestTitle: testToday ? testToday.title : null
     });
   } catch (err) {
     res.status(500).json({ status: "Error", error: err.message });
