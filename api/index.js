@@ -163,29 +163,34 @@ app.get("/", async (req, res) => {
   }
 });
 
-// GET TODAY TEST – using IST for comparison
+// GET TODAY TEST – using IST date
 app.get("/user/today-test", userAuth, async (req, res) => {
   try {
     await connectDB();
 
-    const today = new Date().toISOString().split("T")[0];
-    const test = await Test.findOne({ date: today });
-
-    if (!test) {
-      return res.status(404).json({ message: "No test today" });
-    }
-
-    // ─── IMPORTANT: Compare time in Indian Standard Time (IST = UTC+5:30) ───
+    // Calculate today in IST (UTC + 5:30)
     const nowUTC = new Date();
     const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000; // 5 hours 30 minutes
     const nowIST = new Date(nowUTC.getTime() + IST_OFFSET_MS);
+    
+    // Get YYYY-MM-DD in Indian time
+    const todayIST = nowIST.toISOString().split("T")[0];
 
-    const startTimeUTC = new Date(test.startTime);
-    const endTimeUTC = new Date(test.endTime);
+    console.log("Server UTC date:", nowUTC.toISOString().split("T")[0]);
+    console.log("Calculated IST date:", todayIST);
 
-    // Convert stored UTC times to IST for comparison
-    const startTimeIST = new Date(startTimeUTC.getTime() + IST_OFFSET_MS);
-    const endTimeIST = new Date(endTimeUTC.getTime() + IST_OFFSET_MS);
+    const test = await Test.findOne({ date: todayIST });
+
+    if (!test) {
+      return res.status(404).json({ 
+        message: "No test today",
+        debug: { requestedDate: todayIST }
+      });
+    }
+
+    // Time comparison in IST
+    const startTimeIST = new Date(test.startTime.getTime() + IST_OFFSET_MS);
+    const endTimeIST   = new Date(test.endTime.getTime() + IST_OFFSET_MS);
 
     if (nowIST < startTimeIST) {
       return res.json({
@@ -204,7 +209,6 @@ app.get("/user/today-test", userAuth, async (req, res) => {
       });
     }
 
-    // Test is active
     const questions = await Question.find({ testId: test._id }).select("-correctOption");
 
     res.json({
@@ -219,10 +223,9 @@ app.get("/user/today-test", userAuth, async (req, res) => {
 
   } catch (err) {
     console.error("today-test error:", err.message);
-    res.status(500).json({ message: "Server error" });
+    res.status(500).json({ message: "Server error", detail: err.message });
   }
 });
-
 // SUBMIT TEST
 app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
   try {
