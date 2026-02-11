@@ -320,6 +320,10 @@ app.get("/user/leaderboard/:testId", userAuth, async (req, res) => {
 //           FREE TEST SERIES – PUBLIC + RANKING
 // ────────────────────────────────────────────────
 
+// ────────────────────────────────────────────────
+//           FREE TEST SERIES – PERSISTENT / EVERGREEN
+// ────────────────────────────────────────────────
+
 app.get("/free/today-test", async (req, res) => {
   try {
     await connectDB();
@@ -327,30 +331,43 @@ app.get("/free/today-test", async (req, res) => {
     const now = new Date();
     const IST_OFFSET = 5.5 * 60 * 60 * 1000;
     const nowIST = new Date(now.getTime() + IST_OFFSET);
-    const todayStr = nowIST.toISOString().split("T")[0];
 
-    // Only free tests
-    const test = await Test.findOne({ date: todayStr, testType: "free" });
+    // Find the MOST RECENT free test (no date filter)
+    // You can later add isActive: true if you want to control visibility
+    const test = await Test.findOne({ testType: "free" })
+      .sort({ createdAt: -1 })           // newest first
+      .lean();
+
     if (!test) {
-      return res.status(404).json({ message: "No free test available today" });
+      return res.status(404).json({ message: "No free test available at the moment" });
     }
 
-    const startIST = new Date(test.startTime.getTime() + IST_OFFSET);
-    const endIST   = new Date(test.endTime.getTime()   + IST_OFFSET);
+    const startIST = test.startTime ? new Date(test.startTime.getTime() + IST_OFFSET) : null;
+    const endIST   = test.endTime   ? new Date(test.endTime.getTime()   + IST_OFFSET)   : null;
+
+    // Optional: if you still want time window check for free tests, keep this
+    // If you want completely unlimited access → remove the time checks below
+    let status = "active";
+    if (startIST && nowIST < startIST) {
+      status = "not_started";
+    } else if (endIST && nowIST > endIST) {
+      status = "ended";
+    }
 
     const questions = await Question.find({ testId: test._id })
       .select("-correctOption")
       .lean();
 
     res.json({
-      status: nowIST >= startIST && nowIST <= endIST ? "active" : (nowIST < startIST ? "not_started" : "ended"),
+      status,
       testId: test._id.toString(),
       title: test.title,
       totalQuestions: test.totalQuestions,
-      startTimeIST: startIST.toISOString(),
-      endTimeIST: endIST.toISOString(),
+      startTimeIST: startIST?.toISOString() || null,
+      endTimeIST: endIST?.toISOString() || null,
       questions,
-      note: "Free practice test – public leaderboard available"
+      note: "This is a persistent free practice test — available anytime until deleted by admin",
+      isPersistentFreeTest: true 
     });
   } catch (err) {
     console.error("free/today-test error:", err.message);
