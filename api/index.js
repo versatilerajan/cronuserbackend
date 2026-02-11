@@ -8,6 +8,8 @@ const rateLimit = require("express-rate-limit");
 const admin = require("firebase-admin");
 
 const app = express();
+
+// ================= MIDDLEWARE =================
 app.use(express.json({ limit: "10kb" }));
 app.use(cors({
   origin: true,
@@ -26,6 +28,7 @@ app.use(helmet());
 app.use(compression());
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 500 }));
 
+// ================= DATABASE =================
 let cached = global.mongoose || { conn: null, promise: null };
 global.mongoose = cached;
 
@@ -50,6 +53,8 @@ async function connectDB() {
   cached.conn = await cached.promise;
   return cached.conn;
 }
+
+// ================= FIREBASE INIT (for paid users only) =================
 let firebaseInitialized = false;
 if (!admin.apps.length) {
   try {
@@ -66,9 +71,10 @@ if (!admin.apps.length) {
   }
 }
 
+// ================= SCHEMAS =================
 const testSchema = new mongoose.Schema({
   title: String,
-  date: String,          
+  date: String,           // "YYYY-MM-DD" in IST
   startTime: Date,
   endTime: Date,
   totalQuestions: Number
@@ -92,15 +98,26 @@ const resultSchema = new mongoose.Schema({
   testId: mongoose.Schema.Types.ObjectId,
   score: Number,
   totalQuestions: Number,
-  submittedAt: { type: Date, default: Date.now, required: true },   
+  submittedAt: { type: Date, default: Date.now, required: true },
 }, { timestamps: true });
 
 resultSchema.index({ testId: 1, score: -1, submittedAt: 1 });
 
+const freeResultSchema = new mongoose.Schema({
+  testId: mongoose.Schema.Types.ObjectId,
+  score: Number,
+  totalQuestions: Number,
+  submittedAt: { type: Date, default: Date.now, required: true },
+}, { timestamps: true });
+
+freeResultSchema.index({ testId: 1, score: -1, submittedAt: 1 });
+
 const Test = mongoose.models.Test || mongoose.model("Test", testSchema);
 const Question = mongoose.models.Question || mongoose.model("Question", questionSchema);
 const Result = mongoose.models.Result || mongoose.model("Result", resultSchema);
+const FreeResult = mongoose.models.FreeResult || mongoose.model("FreeResult", freeResultSchema);
 
+// ================= AUTH MIDDLEWARE (only for paid routes) =================
 const userAuth = async (req, res, next) => {
   if (!firebaseInitialized) return res.status(503).json({ message: "Auth service unavailable" });
   const authHeader = req.headers.authorization;
@@ -115,6 +132,7 @@ const userAuth = async (req, res, next) => {
   }
 };
 
+// ================= ROUTES =================
 app.get("/", async (req, res) => {
   try {
     await connectDB();
@@ -132,7 +150,10 @@ app.get("/", async (req, res) => {
   }
 });
 
-// GET TODAY TEST – using IST date
+// ────────────────────────────────────────────────
+//           PAID / AUTHENTICATED TEST ROUTES
+// ────────────────────────────────────────────────
+
 app.get("/user/today-test", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -142,28 +163,16 @@ app.get("/user/today-test", userAuth, async (req, res) => {
     const todayIST = nowIST.toISOString().split("T")[0];
 
     const test = await Test.findOne({ date: todayIST });
-    if (!test) {
-      return res.status(404).json({ message: "No test today", debug: { requestedDate: todayIST } });
-    }
+    if (!test) return res.status(404).json({ message: "No test today" });
 
     const startTimeIST = new Date(test.startTime.getTime() + IST_OFFSET_MS);
     const endTimeIST   = new Date(test.endTime.getTime()   + IST_OFFSET_MS);
 
     if (nowIST < startTimeIST) {
-      return res.json({
-        status: "not_started",
-        title: test.title,
-        startTimeIST: startTimeIST.toISOString(),
-        message: "Test starts at 00:00 IST"
-      });
+      return res.json({ status: "not_started", title: test.title, startTimeIST: startTimeIST.toISOString() });
     }
-
     if (nowIST > endTimeIST) {
-      return res.json({
-        status: "ended",
-        title: test.title,
-        message: "Today's test has ended."
-      });
+      return res.json({ status: "ended", title: test.title });
     }
 
     const questions = await Question.find({ testId: test._id }).select("-correctOption");
@@ -182,7 +191,6 @@ app.get("/user/today-test", userAuth, async (req, res) => {
   }
 });
 
-// SUBMIT TEST
 app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -193,26 +201,20 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
 
     let score = 0;
     questions.forEach(q => {
-      const userAnswer = answers.find(a => a.questionId === q._id.toString());
-      if (userAnswer && userAnswer.selectedOption === q.correctOption) score++;
+      const ua = answers.find(a => a.questionId === q._id.toString());
+      if (ua && ua.selectedOption === q.correctOption) score++;
     });
 
-    const already = await Result.findOne({
-      userId: req.user.uid,
-      testId: req.params.testId
-    });
+    const already = await Result.findOne({ userId: req.user.uid, testId: req.params.testId });
     if (already) return res.status(400).json({ message: "Already submitted" });
 
     const result = await Result.create({
       userId: req.user.uid,
       testId: req.params.testId,
       score,
-      totalQuestions: questions.length,
-      // submittedAt = now (default)
+      totalQuestions: questions.length
     });
 
-    // Simple rank at time of submission (for immediate feedback)
-    // Better full rank is available via /my-rank
     const betterCount = await Result.countDocuments({
       testId: req.params.testId,
       $or: [
@@ -225,7 +227,7 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       score,
       totalQuestions: questions.length,
       preliminaryRank: betterCount + 1,
-      message: "Use /my-rank endpoint for final position after 6 PM"
+      message: "Use /user/my-rank for final position"
     });
   } catch (err) {
     console.error("submit-test error:", err.message);
@@ -233,7 +235,6 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
   }
 });
 
-// GET MY CURRENT RANK (efficient + handles ties)
 app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -243,11 +244,8 @@ app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
       testId: req.params.testId
     });
 
-    if (!result) {
-      return res.status(404).json({ message: "You have not submitted this test" });
-    }
+    if (!result) return res.status(404).json({ message: "You have not submitted this test" });
 
-    // Count how many are strictly better
     const betterCount = await Result.countDocuments({
       testId: req.params.testId,
       $or: [
@@ -256,7 +254,6 @@ app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
       ]
     });
 
-    // Count how many have exactly same score & time (including self)
     const ties = await Result.countDocuments({
       testId: req.params.testId,
       score: result.score,
@@ -269,7 +266,7 @@ app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
     res.json({
       yourScore: result.score,
       submittedAt: result.submittedAt,
-      rank,                   // starting rank of the tie group
+      rank,
       rankDisplay: `${rank} / ${total}`,
       tiesInGroup: ties,
       message: ties > 1 ? `Tied with ${ties - 1} others` : "Unique position"
@@ -280,28 +277,132 @@ app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
   }
 });
 
-// LEADERBOARD – now returns ranked list (paginated / top-heavy)
-app.get("/user/leaderboard/:testId", async (req, res) => {
+app.get("/user/leaderboard/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
-    const page = Math.max(1, parseInt(req.query.page) || 1);
-    const limit = Math.min(100, parseInt(req.query.limit) || 50);
-
-    const results = await Result.find({ testId: req.params.testId })
+    const top = await Result.find({ testId: req.params.testId })
       .sort({ score: -1, submittedAt: 1 })
-      .skip((page - 1) * limit)
-      .limit(limit)
+      .limit(50)
       .lean();
 
     const total = await Result.countDocuments({ testId: req.params.testId });
+
+    res.json({ leaderboard: top, totalParticipants: total });
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// ────────────────────────────────────────────────
+//           FREE TEST SERIES – PUBLIC + RANKING
+// ────────────────────────────────────────────────
+
+app.get("/free/today-test", async (req, res) => {
+  try {
+    await connectDB();
+
+    const now = new Date();
+    const IST_OFFSET = 5.5 * 60 * 60 * 1000;
+    const nowIST = new Date(now.getTime() + IST_OFFSET);
+    const todayStr = nowIST.toISOString().split("T")[0];
+
+    const test = await Test.findOne({ date: todayStr });
+    if (!test) {
+      return res.status(404).json({ message: "No free test available today" });
+    }
+
+    const startIST = new Date(test.startTime.getTime() + IST_OFFSET);
+    const endIST   = new Date(test.endTime.getTime()   + IST_OFFSET);
+
+    const questions = await Question.find({ testId: test._id })
+      .select("-correctOption")
+      .lean();
+
     res.json({
-      leaderboard: results,
-      totalParticipants: total,
-      page,
-      limit
+      status: nowIST >= startIST && nowIST <= endIST ? "active" : (nowIST < startIST ? "not_started" : "ended"),
+      testId: test._id.toString(),
+      title: test.title,
+      totalQuestions: test.totalQuestions,
+      startTimeIST: startIST.toISOString(),
+      endTimeIST: endIST.toISOString(),
+      questions,
+      note: "Free practice test – public leaderboard available"
     });
   } catch (err) {
-    console.error("leaderboard error:", err.message);
+    console.error("free/today-test error:", err.message);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.post("/free/submit-test/:testId", async (req, res) => {
+  try {
+    await connectDB();
+    const { answers } = req.body;
+
+    if (!Array.isArray(answers)) return res.status(400).json({ message: "answers must be array" });
+
+    const questions = await Question.find({ testId: req.params.testId });
+    if (!questions.length) return res.status(404).json({ message: "Test not found" });
+
+    let score = 0;
+    questions.forEach(q => {
+      const ua = answers.find(a => a.questionId === q._id.toString());
+      if (ua && ua.selectedOption === q.correctOption) score++;
+    });
+
+    const result = await FreeResult.create({
+      testId: req.params.testId,
+      score,
+      totalQuestions: questions.length
+    });
+
+    const betterCount = await FreeResult.countDocuments({
+      testId: req.params.testId,
+      $or: [
+        { score: { $gt: score } },
+        { score, submittedAt: { $lt: result.submittedAt } }
+      ]
+    });
+
+    const total = await FreeResult.countDocuments({ testId: req.params.testId });
+
+    res.json({
+      score,
+      total,
+      yourRank: betterCount + 1,
+      rankDisplay: `${betterCount + 1} / ${total}`,
+      message: "Submitted – your rank is now visible on the public leaderboard"
+    });
+  } catch (err) {
+    console.error("free/submit error:", err.message);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.get("/free/leaderboard/:testId", async (req, res) => {
+  try {
+    await connectDB();
+
+    const results = await FreeResult.find({ testId: req.params.testId })
+      .sort({ score: -1, submittedAt: 1 })
+      .limit(100)
+      .lean();
+
+    const total = await FreeResult.countDocuments({ testId: req.params.testId });
+
+    const leaderboard = results.map((r, idx) => ({
+      rank: idx + 1,
+      score: r.score,
+      totalQuestions: r.totalQuestions,
+      submittedAt: r.submittedAt
+    }));
+
+    res.json({
+      leaderboard,
+      totalParticipants: total
+    });
+  } catch (err) {
+    console.error("free/leaderboard error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
