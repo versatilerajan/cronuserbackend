@@ -51,10 +51,17 @@ async function connectDB() {
       });
   }
   cached.conn = await cached.promise;
+
+  // Create compound unique index (run once - safe to call multiple times)
+  await mongoose.model("Test").collection.createIndex(
+    { date: 1, testType: 1 },
+    { unique: true, background: true }
+  );
+
   return cached.conn;
 }
 
-// ================= FIREBASE INIT (for paid users only) =================
+// ================= FIREBASE INIT =================
 let firebaseInitialized = false;
 if (!admin.apps.length) {
   try {
@@ -74,11 +81,15 @@ if (!admin.apps.length) {
 // ================= SCHEMAS =================
 const testSchema = new mongoose.Schema({
   title: String,
-  date: String,           // "YYYY-MM-DD" in IST
+  date: String,
   startTime: Date,
   endTime: Date,
-  totalQuestions: Number
+  totalQuestions: Number,
+  testType: { type: String, enum: ["paid", "free"], required: true }
 }, { timestamps: true });
+
+// Compound unique index → one paid + one free per date is allowed
+testSchema.index({ date: 1, testType: 1 }, { unique: true });
 
 const questionSchema = new mongoose.Schema({
   testId: mongoose.Schema.Types.ObjectId,
@@ -117,7 +128,7 @@ const Question = mongoose.models.Question || mongoose.model("Question", question
 const Result = mongoose.models.Result || mongoose.model("Result", resultSchema);
 const FreeResult = mongoose.models.FreeResult || mongoose.model("FreeResult", freeResultSchema);
 
-// ================= AUTH MIDDLEWARE (only for paid routes) =================
+// ================= AUTH MIDDLEWARE =================
 const userAuth = async (req, res, next) => {
   if (!firebaseInitialized) return res.status(503).json({ message: "Auth service unavailable" });
   const authHeader = req.headers.authorization;
@@ -137,13 +148,11 @@ app.get("/", async (req, res) => {
   try {
     await connectDB();
     const today = new Date().toISOString().split("T")[0];
-    const testToday = await Test.findOne({ date: today });
     res.json({
       status: "User Backend Running",
       firebaseReady: firebaseInitialized,
       mongoReady: mongoose.connection.readyState === 1 ? "connected" : "not connected",
       currentServerDateUTC: today,
-      foundTestForToday: !!testToday,
     });
   } catch (err) {
     res.status(500).json({ status: "Error", error: err.message });
@@ -162,17 +171,30 @@ app.get("/user/today-test", userAuth, async (req, res) => {
     const nowIST = new Date(nowUTC.getTime() + IST_OFFSET_MS);
     const todayIST = nowIST.toISOString().split("T")[0];
 
-    const test = await Test.findOne({ date: todayIST });
-    if (!test) return res.status(404).json({ message: "No test today" });
+    // Only paid tests for authenticated users
+    const test = await Test.findOne({ date: todayIST, testType: "paid" });
+    if (!test) {
+      return res.status(404).json({ message: "No paid test available today" });
+    }
 
     const startTimeIST = new Date(test.startTime.getTime() + IST_OFFSET_MS);
     const endTimeIST   = new Date(test.endTime.getTime()   + IST_OFFSET_MS);
 
     if (nowIST < startTimeIST) {
-      return res.json({ status: "not_started", title: test.title, startTimeIST: startTimeIST.toISOString() });
+      return res.json({
+        status: "not_started",
+        title: test.title,
+        startTimeIST: startTimeIST.toISOString(),
+        message: "Paid test starts at 00:00 IST"
+      });
     }
+
     if (nowIST > endTimeIST) {
-      return res.json({ status: "ended", title: test.title });
+      return res.json({
+        status: "ended",
+        title: test.title,
+        message: "Today's paid test has ended."
+      });
     }
 
     const questions = await Question.find({ testId: test._id }).select("-correctOption");
@@ -186,7 +208,7 @@ app.get("/user/today-test", userAuth, async (req, res) => {
       questions
     });
   } catch (err) {
-    console.error("today-test error:", err.message);
+    console.error("paid/today-test error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -230,7 +252,7 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       message: "Use /user/my-rank for final position"
     });
   } catch (err) {
-    console.error("submit-test error:", err.message);
+    console.error("paid/submit-test error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -272,7 +294,7 @@ app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
       message: ties > 1 ? `Tied with ${ties - 1} others` : "Unique position"
     });
   } catch (err) {
-    console.error("my-rank error:", err.message);
+    console.error("paid/my-rank error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -280,15 +302,16 @@ app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
 app.get("/user/leaderboard/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
-    const top = await Result.find({ testId: req.params.testId })
+    const results = await Result.find({ testId: req.params.testId })
       .sort({ score: -1, submittedAt: 1 })
       .limit(50)
       .lean();
 
     const total = await Result.countDocuments({ testId: req.params.testId });
 
-    res.json({ leaderboard: top, totalParticipants: total });
+    res.json({ leaderboard: results, totalParticipants: total });
   } catch (err) {
+    console.error("paid/leaderboard error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -306,7 +329,8 @@ app.get("/free/today-test", async (req, res) => {
     const nowIST = new Date(now.getTime() + IST_OFFSET);
     const todayStr = nowIST.toISOString().split("T")[0];
 
-    const test = await Test.findOne({ date: todayStr });
+    // Only free tests
+    const test = await Test.findOne({ date: todayStr, testType: "free" });
     if (!test) {
       return res.status(404).json({ message: "No free test available today" });
     }
