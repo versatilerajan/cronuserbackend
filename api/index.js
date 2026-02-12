@@ -8,8 +8,6 @@ const rateLimit = require("express-rate-limit");
 const admin = require("firebase-admin");
 
 const app = express();
-
-// ================= MIDDLEWARE =================
 app.use(express.json({ limit: "10kb" }));
 app.use(cors({
   origin: true,
@@ -28,7 +26,6 @@ app.use(helmet());
 app.use(compression());
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 500 }));
 
-// ================= DATABASE =================
 let cached = global.mongoose || { conn: null, promise: null };
 global.mongoose = cached;
 
@@ -52,7 +49,7 @@ async function connectDB() {
   }
   cached.conn = await cached.promise;
 
-  // Create compound unique index (run once - safe to call multiple times)
+  // Compound index for unique test per date + type
   await mongoose.model("Test").collection.createIndex(
     { date: 1, testType: 1 },
     { unique: true, background: true }
@@ -77,8 +74,6 @@ if (!admin.apps.length) {
     console.error("Firebase Admin Initialization FAILED:", err.message);
   }
 }
-
-// ================= SCHEMAS =================
 const testSchema = new mongoose.Schema({
   title: String,
   date: String,
@@ -88,7 +83,6 @@ const testSchema = new mongoose.Schema({
   testType: { type: String, enum: ["paid", "free"], required: true }
 }, { timestamps: true });
 
-// Compound unique index → one paid + one free per date is allowed
 testSchema.index({ date: 1, testType: 1 }, { unique: true });
 
 const questionSchema = new mongoose.Schema({
@@ -109,26 +103,30 @@ const resultSchema = new mongoose.Schema({
   testId: mongoose.Schema.Types.ObjectId,
   score: Number,
   totalQuestions: Number,
-  submittedAt: { type: Date, default: Date.now, required: true },
+  submittedAt: { type: Date, default: Date.now },
+  startedAt: Date,
+  isLate: { type: Boolean, default: false },
+  answers: [{
+    questionId: String,
+    selectedOption: String
+  }]
 }, { timestamps: true });
 
-resultSchema.index({ testId: 1, score: -1, submittedAt: 1 });
+resultSchema.index({ testId: 1, isLate: 1, score: -1, submittedAt: 1 });
 
 const freeResultSchema = new mongoose.Schema({
   testId: mongoose.Schema.Types.ObjectId,
   score: Number,
   totalQuestions: Number,
-  submittedAt: { type: Date, default: Date.now, required: true },
+  submittedAt: { type: Date, default: Date.now },
 }, { timestamps: true });
 
 freeResultSchema.index({ testId: 1, score: -1, submittedAt: 1 });
 
-const Test = mongoose.models.Test || mongoose.model("Test", testSchema);
-const Question = mongoose.models.Question || mongoose.model("Question", questionSchema);
-const Result = mongoose.models.Result || mongoose.model("Result", resultSchema);
+const Test       = mongoose.models.Test       || mongoose.model("Test", testSchema);
+const Question   = mongoose.models.Question   || mongoose.model("Question", questionSchema);
+const Result     = mongoose.models.Result     || mongoose.model("Result", resultSchema);
 const FreeResult = mongoose.models.FreeResult || mongoose.model("FreeResult", freeResultSchema);
-
-// ================= AUTH MIDDLEWARE =================
 const userAuth = async (req, res, next) => {
   if (!firebaseInitialized) return res.status(503).json({ message: "Auth service unavailable" });
   const authHeader = req.headers.authorization;
@@ -159,56 +157,57 @@ app.get("/", async (req, res) => {
   }
 });
 
-// ────────────────────────────────────────────────
-//           PAID / AUTHENTICATED TEST ROUTES
-// ────────────────────────────────────────────────
-
 app.get("/user/today-test", userAuth, async (req, res) => {
   try {
     await connectDB();
-    const nowUTC = new Date();
+    const now = new Date();
     const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
-    const nowIST = new Date(nowUTC.getTime() + IST_OFFSET_MS);
+    const nowIST = new Date(now.getTime() + IST_OFFSET_MS);
     const todayIST = nowIST.toISOString().split("T")[0];
 
-    // Only paid tests for authenticated users
     const test = await Test.findOne({ date: todayIST, testType: "paid" });
     if (!test) {
       return res.status(404).json({ message: "No paid test available today" });
     }
 
-    const startTimeIST = new Date(test.startTime.getTime() + IST_OFFSET_MS);
-    const endTimeIST   = new Date(test.endTime.getTime()   + IST_OFFSET_MS);
+    const startIST = new Date(test.startTime.getTime() + IST_OFFSET_MS);
+    const endIST   = new Date(test.endTime.getTime()   + IST_OFFSET_MS);
 
-    if (nowIST < startTimeIST) {
+    if (nowIST < startIST) {
       return res.json({
         status: "not_started",
         title: test.title,
-        startTimeIST: startTimeIST.toISOString(),
-        message: "Paid test starts at 00:00 IST"
+        startTimeIST: startIST.toISOString(),
+        message: "Paid test has not started yet"
       });
     }
 
-    if (nowIST > endTimeIST) {
+    if (nowIST > endIST) {
       return res.json({
-        status: "ended",
+        status: "archived",
         title: test.title,
-        message: "Today's paid test has ended."
+        endTimeIST: endIST.toISOString(),
+        message: "Today's paid test has ended and is now archived.",
+        testId: test._id.toString(),
+        canReview: true
       });
     }
 
-    const questions = await Question.find({ testId: test._id }).select("-correctOption");
+    const questions = await Question.find({ testId: test._id })
+      .select("-correctOption")
+      .lean();
+
     res.json({
       status: "active",
-      testId: test._id,
+      testId: test._id.toString(),
       title: test.title,
       totalQuestions: test.totalQuestions,
-      startTimeIST: startTimeIST.toISOString(),
-      endTimeIST: endTimeIST.toISOString(),
+      startTimeIST: startIST.toISOString(),
+      endTimeIST: endIST.toISOString(),
       questions
     });
   } catch (err) {
-    console.error("paid/today-test error:", err.message);
+    console.error("/user/today-test error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -216,32 +215,77 @@ app.get("/user/today-test", userAuth, async (req, res) => {
 app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
-    const { answers } = req.body;
+    const { answers } = req.body; 
 
-    const questions = await Question.find({ testId: req.params.testId });
-    if (!questions.length) return res.status(404).json({ message: "Test not found" });
+    if (!Array.isArray(answers)) {
+      return res.status(400).json({ message: "answers must be an array of objects" });
+    }
+
+    const test = await Test.findById(req.params.testId);
+    if (!test || test.testType !== "paid") {
+      return res.status(404).json({ message: "Paid test not found" });
+    }
+
+    const questions = await Question.find({ testId: test._id });
+    if (questions.length === 0) {
+      return res.status(404).json({ message: "No questions found for this test" });
+    }
+
+    const now = new Date();
+    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+    const nowIST = new Date(now.getTime() + IST_OFFSET_MS);
+    const endIST = new Date(test.endTime.getTime() + IST_OFFSET_MS);
+
+    const isLate = nowIST > endIST;
+
+    // Block re-attempts
+    const existingResult = await Result.findOne({ userId: req.user.uid, testId: test._id });
+    if (existingResult) {
+      return res.status(403).json({
+        message: existingResult.isLate
+          ? "You have already submitted a practice (late) attempt"
+          : "You have already submitted this test"
+      });
+    }
 
     let score = 0;
-    questions.forEach(q => {
-      const ua = answers.find(a => a.questionId === q._id.toString());
-      if (ua && ua.selectedOption === q.correctOption) score++;
+    const savedAnswers = answers.map(ans => {
+      const q = questions.find(qq => qq._id.toString() === ans.questionId);
+      if (q && ans.selectedOption === q.correctOption) score++;
+      return {
+        questionId: ans.questionId,
+        selectedOption: ans.selectedOption || null
+      };
     });
-
-    const already = await Result.findOne({ userId: req.user.uid, testId: req.params.testId });
-    if (already) return res.status(400).json({ message: "Already submitted" });
 
     const result = await Result.create({
       userId: req.user.uid,
-      testId: req.params.testId,
+      testId: test._id,
       score,
-      totalQuestions: questions.length
+      totalQuestions: questions.length,
+      submittedAt: now,
+      startedAt: now, 
+      isLate,
+      answers: savedAnswers
     });
 
+    if (isLate) {
+      return res.json({
+        message: "You are late. The test is closed. Your attempt will not be ranked.",
+        score,
+        totalQuestions: questions.length,
+        isLate: true,
+        isRanked: false
+      });
+    }
+
+    // On-time attempt → calculate preliminary rank
     const betterCount = await Result.countDocuments({
-      testId: req.params.testId,
+      testId: test._id,
+      isLate: false,
       $or: [
         { score: { $gt: score } },
-        { score, submittedAt: { $lt: result.submittedAt } }
+        { score, submittedAt: { $lt: now } }
       ]
     });
 
@@ -249,10 +293,12 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       score,
       totalQuestions: questions.length,
       preliminaryRank: betterCount + 1,
-      message: "Use /user/my-rank for final position"
+      isLate: false,
+      isRanked: true,
+      message: "Test submitted successfully. Check your final rank at /user/my-rank/:testId"
     });
   } catch (err) {
-    console.error("paid/submit-test error:", err.message);
+    console.error("/user/submit-test error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -260,41 +306,50 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
 app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
-
     const result = await Result.findOne({
       userId: req.user.uid,
       testId: req.params.testId
     });
 
-    if (!result) return res.status(404).json({ message: "You have not submitted this test" });
+    if (!result) {
+      return res.status(404).json({ message: "You have not attempted this test" });
+    }
+
+    if (result.isLate) {
+      return res.json({
+        isLate: true,
+        score: result.score,
+        totalQuestions: result.totalQuestions,
+        submittedAt: result.submittedAt,
+        message: "This was a late attempt for practice only – no rank is available"
+      });
+    }
 
     const betterCount = await Result.countDocuments({
       testId: req.params.testId,
+      isLate: false,
       $or: [
         { score: { $gt: result.score } },
         { score: result.score, submittedAt: { $lt: result.submittedAt } }
       ]
     });
 
-    const ties = await Result.countDocuments({
+    const totalRanked = await Result.countDocuments({
       testId: req.params.testId,
-      score: result.score,
-      submittedAt: result.submittedAt
+      isLate: false
     });
-
-    const rank = betterCount + 1;
-    const total = await Result.countDocuments({ testId: req.params.testId });
 
     res.json({
-      yourScore: result.score,
+      score: result.score,
+      totalQuestions: result.totalQuestions,
       submittedAt: result.submittedAt,
-      rank,
-      rankDisplay: `${rank} / ${total}`,
-      tiesInGroup: ties,
-      message: ties > 1 ? `Tied with ${ties - 1} others` : "Unique position"
+      rank: betterCount + 1,
+      totalRankedParticipants: totalRanked,
+      rankDisplay: `${betterCount + 1} / ${totalRanked}`,
+      message: "This is your final rank among on-time participants"
     });
   } catch (err) {
-    console.error("paid/my-rank error:", err.message);
+    console.error("/user/my-rank error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -302,40 +357,105 @@ app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
 app.get("/user/leaderboard/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
-    const results = await Result.find({ testId: req.params.testId })
+    const results = await Result.find({
+      testId: req.params.testId,
+      isLate: false
+    })
       .sort({ score: -1, submittedAt: 1 })
       .limit(50)
       .lean();
 
-    const total = await Result.countDocuments({ testId: req.params.testId });
+    const total = await Result.countDocuments({
+      testId: req.params.testId,
+      isLate: false
+    });
 
-    res.json({ leaderboard: results, totalParticipants: total });
+    res.json({
+      leaderboard: results,
+      totalRankedParticipants: total,
+      note: "Only on-time (valid) attempts are included in the ranking"
+    });
   } catch (err) {
-    console.error("paid/leaderboard error:", err.message);
+    console.error("/user/leaderboard error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
 
-// ────────────────────────────────────────────────
-//           FREE TEST SERIES – PUBLIC + RANKING
-// ────────────────────────────────────────────────
+app.get("/user/review-test/:testId", userAuth, async (req, res) => {
+  try {
+    await connectDB();
+    const test = await Test.findById(req.params.testId);
+    if (!test || test.testType !== "paid") {
+      return res.status(404).json({ message: "Test not found or not a paid test" });
+    }
 
-// ────────────────────────────────────────────────
-//           FREE TEST SERIES – PERSISTENT / EVERGREEN
-// ────────────────────────────────────────────────
+    const result = await Result.findOne({
+      userId: req.user.uid,
+      testId: test._id
+    });
+
+    if (!result) {
+      return res.status(404).json({ message: "You did not attempt this test" });
+    }
+
+    const questions = await Question.find({ testId: test._id }).lean();
+
+    const reviewQuestions = questions.map(q => {
+      const userAnswer = result.answers.find(a => a.questionId === q._id.toString());
+      return {
+        questionNumber: q.questionNumber,
+        questionStatement: q.questionStatement,
+        options: q.options,
+        yourAnswer: userAnswer?.selectedOption || null,
+        correctAnswer: q.correctOption,
+        isCorrect: userAnswer ? userAnswer.selectedOption === q.correctOption : false
+      };
+    });
+
+    let rankInfo = null;
+    if (!result.isLate) {
+      const betterCount = await Result.countDocuments({
+        testId: test._id,
+        isLate: false,
+        $or: [
+          { score: { $gt: result.score } },
+          { score: result.score, submittedAt: { $lt: result.submittedAt } }
+        ]
+      });
+      const total = await Result.countDocuments({ testId: test._id, isLate: false });
+      rankInfo = {
+        rank: betterCount + 1,
+        totalParticipants: total
+      };
+    }
+
+    res.json({
+      title: test.title,
+      score: result.score,
+      totalQuestions: result.totalQuestions,
+      submittedAt: result.submittedAt,
+      isLate: result.isLate,
+      rankInfo,
+      questions: reviewQuestions,
+      message: result.isLate
+        ? "This was a late attempt – shown for practice/review only (no rank)"
+        : "Review your answers, correct solutions, and final rank"
+    });
+  } catch (err) {
+    console.error("/user/review-test error:", err.message);
+    res.status(500).json({ message: "Server error" });
+  }
+});
 
 app.get("/free/today-test", async (req, res) => {
   try {
     await connectDB();
-
     const now = new Date();
     const IST_OFFSET = 5.5 * 60 * 60 * 1000;
     const nowIST = new Date(now.getTime() + IST_OFFSET);
 
-    // Find the MOST RECENT free test (no date filter)
-    // You can later add isActive: true if you want to control visibility
     const test = await Test.findOne({ testType: "free" })
-      .sort({ createdAt: -1 })           // newest first
+      .sort({ createdAt: -1 })
       .lean();
 
     if (!test) {
@@ -343,16 +463,11 @@ app.get("/free/today-test", async (req, res) => {
     }
 
     const startIST = test.startTime ? new Date(test.startTime.getTime() + IST_OFFSET) : null;
-    const endIST   = test.endTime   ? new Date(test.endTime.getTime()   + IST_OFFSET)   : null;
+    const endIST = test.endTime ? new Date(test.endTime.getTime() + IST_OFFSET) : null;
 
-    // Optional: if you still want time window check for free tests, keep this
-    // If you want completely unlimited access → remove the time checks below
     let status = "active";
-    if (startIST && nowIST < startIST) {
-      status = "not_started";
-    } else if (endIST && nowIST > endIST) {
-      status = "ended";
-    }
+    if (startIST && nowIST < startIST) status = "not_started";
+    else if (endIST && nowIST > endIST) status = "ended";
 
     const questions = await Question.find({ testId: test._id })
       .select("-correctOption")
@@ -366,11 +481,11 @@ app.get("/free/today-test", async (req, res) => {
       startTimeIST: startIST?.toISOString() || null,
       endTimeIST: endIST?.toISOString() || null,
       questions,
-      note: "This is a persistent free practice test — available anytime until deleted by admin",
-      isPersistentFreeTest: true 
+      note: "This is a persistent free practice test",
+      isPersistentFreeTest: true
     });
   } catch (err) {
-    console.error("free/today-test error:", err.message);
+    console.error("/free/today-test error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -379,7 +494,6 @@ app.post("/free/submit-test/:testId", async (req, res) => {
   try {
     await connectDB();
     const { answers } = req.body;
-
     if (!Array.isArray(answers)) return res.status(400).json({ message: "answers must be array" });
 
     const questions = await Question.find({ testId: req.params.testId });
@@ -412,10 +526,10 @@ app.post("/free/submit-test/:testId", async (req, res) => {
       total,
       yourRank: betterCount + 1,
       rankDisplay: `${betterCount + 1} / ${total}`,
-      message: "Submitted – your rank is now visible on the public leaderboard"
+      message: "Submitted – your rank is visible on the public leaderboard"
     });
   } catch (err) {
-    console.error("free/submit error:", err.message);
+    console.error("/free/submit error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -423,7 +537,6 @@ app.post("/free/submit-test/:testId", async (req, res) => {
 app.get("/free/leaderboard/:testId", async (req, res) => {
   try {
     await connectDB();
-
     const results = await FreeResult.find({ testId: req.params.testId })
       .sort({ score: -1, submittedAt: 1 })
       .limit(100)
@@ -443,7 +556,7 @@ app.get("/free/leaderboard/:testId", async (req, res) => {
       totalParticipants: total
     });
   } catch (err) {
-    console.error("free/leaderboard error:", err.message);
+    console.error("/free/leaderboard error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
