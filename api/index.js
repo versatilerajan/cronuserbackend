@@ -450,24 +450,19 @@ app.get("/user/review-test/:testId", userAuth, async (req, res) => {
 app.get("/free/today-test", async (req, res) => {
   try {
     await connectDB();
-    const now = new Date();
-    const IST_OFFSET = 5.5 * 60 * 60 * 1000;
-    const nowIST = new Date(now.getTime() + IST_OFFSET);
 
+    // Find the MOST RECENT free test (persistent style)
     const test = await Test.findOne({ testType: "free" })
-      .sort({ createdAt: -1 })
+      .sort({ createdAt: -1 })          // newest first
       .lean();
 
     if (!test) {
       return res.status(404).json({ message: "No free test available at the moment" });
     }
 
-    const startIST = test.startTime ? new Date(test.startTime.getTime() + IST_OFFSET) : null;
-    const endIST = test.endTime ? new Date(test.endTime.getTime() + IST_OFFSET) : null;
-
+    const IST_OFFSET = 5.5 * 60 * 60 * 1000;
+    const nowIST = new Date(Date.now() + IST_OFFSET);
     let status = "active";
-    if (startIST && nowIST < startIST) status = "not_started";
-    else if (endIST && nowIST > endIST) status = "ended";
 
     const questions = await Question.find({ testId: test._id })
       .select("-correctOption")
@@ -476,16 +471,17 @@ app.get("/free/today-test", async (req, res) => {
     res.json({
       status,
       testId: test._id.toString(),
-      title: test.title,
+      title: test.title || "BPSC Free Practice Test",
       totalQuestions: test.totalQuestions,
-      startTimeIST: startIST?.toISOString() || null,
-      endTimeIST: endIST?.toISOString() || null,
+      startTimeIST: test.startTime ? new Date(test.startTime.getTime() + IST_OFFSET).toISOString() : null,
+      endTimeIST: test.endTime ? new Date(test.endTime.getTime() + IST_OFFSET).toISOString() : null,
       questions,
-      note: "This is a persistent free practice test",
-      isPersistentFreeTest: true
+      note: "Persistent free practice test — available anytime until removed by admin",
+      isPersistentFreeTest: true,
+      createdAt: test.createdAt ? new Date(test.createdAt).toISOString() : null
     });
   } catch (err) {
-    console.error("/free/today-test error:", err.message);
+    console.error("free/today-test error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
