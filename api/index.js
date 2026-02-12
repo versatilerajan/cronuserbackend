@@ -447,51 +447,12 @@ app.get("/user/review-test/:testId", userAuth, async (req, res) => {
   }
 });
 
-app.get("/free/today-test", async (req, res) => {
-  try {
-    await connectDB();
-
-    // Find the MOST RECENT free test (persistent style)
-    const test = await Test.findOne({ testType: "free" })
-      .sort({ createdAt: -1 })         
-      .lean();
-
-    if (!test) {
-      return res.status(404).json({ message: "No free test available at the moment" });
-    }
-
-    const IST_OFFSET = 5.5 * 60 * 60 * 1000;
-    const nowIST = new Date(Date.now() + IST_OFFSET);
-    let status = "active";
-
-    const questions = await Question.find({ testId: test._id })
-      .select("-correctOption")
-      .lean();
-
-    res.json({
-      status,
-      testId: test._id.toString(),
-      title: test.title || "BPSC Free Practice Test",
-      totalQuestions: test.totalQuestions,
-      startTimeIST: test.startTime ? new Date(test.startTime.getTime() + IST_OFFSET).toISOString() : null,
-      endTimeIST: test.endTime ? new Date(test.endTime.getTime() + IST_OFFSET).toISOString() : null,
-      questions,
-      note: "Persistent free practice test — available anytime until removed by admin",
-      isPersistentFreeTest: true,
-      createdAt: test.createdAt ? new Date(test.createdAt).toISOString() : null
-    });
-  } catch (err) {
-    console.error("free/today-test error:", err.message);
-    res.status(500).json({ message: "Server error" });
-  }
-});
-
 app.get("/free/tests", async (req, res) => {
   try {
     await connectDB();
 
     const tests = await Test.find({ testType: "free" })
-      .sort({ createdAt: -1 })          // newest first
+      .sort({ createdAt: -1 })
       .select("title date totalQuestions startTime endTime createdAt")
       .lean();
 
@@ -504,7 +465,7 @@ app.get("/free/tests", async (req, res) => {
     const formatted = tests.map(t => ({
       testId: t._id.toString(),
       title: t.title || "BPSC Free Practice Test",
-      date: t.date,
+      date: t.date || "—",
       totalQuestions: t.totalQuestions,
       createdAt: t.createdAt ? new Date(t.createdAt).toISOString() : null,
       startTimeIST: t.startTime ? new Date(t.startTime.getTime() + IST_OFFSET).toISOString() : null,
@@ -514,6 +475,72 @@ app.get("/free/tests", async (req, res) => {
     res.json({ success: true, tests: formatted });
   } catch (err) {
     console.error("/free/tests error:", err.message);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.get("/free/test/:testId", async (req, res) => {
+  try {
+    await connectDB();
+
+    const test = await Test.findOne({ _id: req.params.testId, testType: "free" }).lean();
+    if (!test) {
+      return res.status(404).json({ message: "Free test not found" });
+    }
+
+    const questions = await Question.find({ testId: test._id })
+      .select("-correctOption")
+      .lean();
+
+    const IST_OFFSET = 5.5 * 60 * 60 * 1000;
+
+    res.json({
+      status: "active",
+      testId: test._id.toString(),
+      title: test.title || "BPSC Free Practice Test",
+      totalQuestions: test.totalQuestions,
+      date: test.date,
+      questions,
+      note: "Persistent free practice test — available anytime until removed by admin",
+      isPersistentFreeTest: true
+    });
+  } catch (err) {
+    console.error("/free/test/:testId error:", err.message);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// Legacy endpoint – kept for backward compatibility, now always returns newest free test as active
+app.get("/free/today-test", async (req, res) => {
+  try {
+    await connectDB();
+
+    const test = await Test.findOne({ testType: "free" })
+      .sort({ createdAt: -1 })
+      .lean();
+
+    if (!test) {
+      return res.status(404).json({ message: "No free test available at the moment" });
+    }
+
+    const questions = await Question.find({ testId: test._id })
+      .select("-correctOption")
+      .lean();
+
+    const IST_OFFSET = 5.5 * 60 * 60 * 1000;
+
+    res.json({
+      status: "active",
+      testId: test._id.toString(),
+      title: test.title || "BPSC Free Practice Test",
+      totalQuestions: test.totalQuestions,
+      date: test.date,
+      questions,
+      note: "Persistent free practice test — available anytime until removed by admin",
+      isPersistentFreeTest: true
+    });
+  } catch (err) {
+    console.error("/free/today-test error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
