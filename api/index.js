@@ -453,7 +453,7 @@ app.get("/free/today-test", async (req, res) => {
 
     // Find the MOST RECENT free test (persistent style)
     const test = await Test.findOne({ testType: "free" })
-      .sort({ createdAt: -1 })          // newest first
+      .sort({ createdAt: -1 })         
       .lean();
 
     if (!test) {
@@ -482,6 +482,38 @@ app.get("/free/today-test", async (req, res) => {
     });
   } catch (err) {
     console.error("free/today-test error:", err.message);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+app.get("/free/tests", async (req, res) => {
+  try {
+    await connectDB();
+
+    const tests = await Test.find({ testType: "free" })
+      .sort({ createdAt: -1 })          // newest first
+      .select("title date totalQuestions startTime endTime createdAt")
+      .lean();
+
+    if (!tests.length) {
+      return res.status(404).json({ message: "No free tests available" });
+    }
+
+    const IST_OFFSET = 5.5 * 60 * 60 * 1000;
+
+    const formatted = tests.map(t => ({
+      testId: t._id.toString(),
+      title: t.title || "BPSC Free Practice Test",
+      date: t.date,
+      totalQuestions: t.totalQuestions,
+      createdAt: t.createdAt ? new Date(t.createdAt).toISOString() : null,
+      startTimeIST: t.startTime ? new Date(t.startTime.getTime() + IST_OFFSET).toISOString() : null,
+      endTimeIST: t.endTime ? new Date(t.endTime.getTime() + IST_OFFSET).toISOString() : null,
+    }));
+
+    res.json({ success: true, tests: formatted });
+  } catch (err) {
+    console.error("/free/tests error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
