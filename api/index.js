@@ -51,10 +51,10 @@ async function connectDB() {
   cached.conn = await cached.promise;
 
   // Indexes for performance
-  await mongoose.model("Test").collection.createIndex(
-    { date: 1, testType: 1 },
-    { unique: true, background: true }
-  );
+  // await mongoose.model("Test").collection.createIndex(
+  //   { date: 1, testType: 1 },
+  //   { unique: true, background: true }
+  // );
   await mongoose.model("Result").collection.createIndex(
     { testId: 1, phase: 1, isLate: 1, score: -1, submittedAt: 1 },
     { background: true }
