@@ -50,11 +50,6 @@ async function connectDB() {
   }
   cached.conn = await cached.promise;
 
-  // Indexes for performance
-  // await mongoose.model("Test").collection.createIndex(
-  //   { date: 1, testType: 1 },
-  //   { unique: true, background: true }
-  // );
   await mongoose.model("Result").collection.createIndex(
     { testId: 1, phase: 1, isLate: 1, score: -1, submittedAt: 1 },
     { background: true }
@@ -109,7 +104,7 @@ const resultSchema = new mongoose.Schema({
   userId: String,
   testId: mongoose.Schema.Types.ObjectId,
   phase: { type: String, enum: ["GS", "CSAT"], required: true },
-  score: Number,              // net score after negative marking
+  score: Number,
   correct: Number,
   incorrect: Number,
   unattempted: Number,
@@ -153,8 +148,27 @@ const userAuth = async (req, res, next) => {
 // ─── HELPERS ──────────────────────────────────────────────────────
 function calculateNetScore(correct, incorrect) {
   const marksPerCorrect = 2;
-  const negativePerWrong = 2 / 3;   // 1/3 of 2 marks
+  const negativePerWrong = 2 / 3;
   return (correct * marksPerCorrect) - (incorrect * negativePerWrong);
+}
+
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+function nowIST() {
+  return new Date(Date.now() + IST_OFFSET_MS);
+}
+
+// Rank reveal time: 5:00 PM IST = 17:00
+function isRankRevealTime() {
+  const ist = nowIST();
+  const hours = ist.getUTCHours();
+  const minutes = ist.getUTCMinutes();
+  // 5:00 PM IST = 11:30 UTC
+  return (hours > 11) || (hours === 11 && minutes >= 30);
+}
+
+function rankRevealTimeIST() {
+  return "5:00 PM IST";
 }
 
 // ─── ROUTES ───────────────────────────────────────────────────────
@@ -177,9 +191,8 @@ app.get("/user/today-test", userAuth, async (req, res) => {
   try {
     await connectDB();
     const now = new Date();
-    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
-    const nowIST = new Date(now.getTime() + IST_OFFSET_MS);
-    const todayIST = nowIST.toISOString().split("T")[0];
+    const istNow = nowIST();
+    const todayIST = istNow.toISOString().split("T")[0];
 
     const test = await Test.findOne({ date: todayIST, testType: "paid" });
     if (!test) {
@@ -189,26 +202,52 @@ app.get("/user/today-test", userAuth, async (req, res) => {
     const startIST = new Date(test.startTime.getTime() + IST_OFFSET_MS);
     const endIST   = new Date(test.endTime.getTime() + IST_OFFSET_MS);
 
-    if (nowIST < startIST) {
+    // Check if user has already submitted (any phase)
+    const existingPhases = ["GS"];
+    if (test.isSundayFullTest) existingPhases.push("CSAT");
+
+    const userResults = await Result.find({
+      userId: req.user.uid,
+      testId: test._id,
+      phase: { $in: existingPhases },
+      isLate: false
+    }).lean();
+
+    const submittedPhases = userResults.map(r => r.phase);
+    const hasSubmitted = submittedPhases.length > 0;
+
+    if (istNow < startIST) {
       return res.json({
         status: "not_started",
         title: test.title,
         startTimeIST: startIST.toISOString(),
+        endTimeIST: endIST.toISOString(),
+        testId: test._id.toString(),
+        totalQuestions: test.totalQuestions,
+        isSundayFullTest: !!test.isSundayFullTest,
+        hasSubmitted: false,
+        submittedPhases: [],
         message: "Test has not started yet"
       });
     }
 
-    if (nowIST > endIST) {
+    if (istNow > endIST) {
       return res.json({
         status: "archived",
         title: test.title,
         endTimeIST: endIST.toISOString(),
-        message: "Today's test has ended and is now archived.",
+        startTimeIST: startIST.toISOString(),
         testId: test._id.toString(),
-        canReview: true
+        totalQuestions: test.totalQuestions,
+        isSundayFullTest: !!test.isSundayFullTest,
+        hasSubmitted,
+        submittedPhases,
+        canReview: hasSubmitted,
+        message: "Today's test has ended and is now archived."
       });
     }
 
+    // Test is active — fetch questions
     const questions = await Question.find({ testId: test._id })
       .select("-correctOption")
       .sort({ questionNumber: 1 })
@@ -222,6 +261,8 @@ app.get("/user/today-test", userAuth, async (req, res) => {
       startTimeIST: startIST.toISOString(),
       endTimeIST: endIST.toISOString(),
       isSundayFullTest: !!test.isSundayFullTest,
+      hasSubmitted,
+      submittedPhases,
     };
 
     if (test.isSundayFullTest) {
@@ -238,6 +279,94 @@ app.get("/user/today-test", userAuth, async (req, res) => {
     res.json(response);
   } catch (err) {
     console.error("/user/today-test error:", err.message);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+// ─── NEW: Check submission status for a specific test ─────────────
+app.get("/user/submission-status/:testId", userAuth, async (req, res) => {
+  try {
+    await connectDB();
+
+    const test = await Test.findById(req.params.testId);
+    if (!test) return res.status(404).json({ message: "Test not found" });
+
+    const phases = test.isSundayFullTest ? ["GS", "CSAT"] : ["GS"];
+
+    const userResults = await Result.find({
+      userId: req.user.uid,
+      testId: test._id,
+      phase: { $in: phases },
+      isLate: false
+    }).lean();
+
+    const submittedPhases = userResults.map(r => r.phase);
+    const hasSubmitted = submittedPhases.length > 0;
+    const rankRevealNow = isRankRevealTime();
+
+    const response = {
+      hasSubmitted,
+      submittedPhases,
+      rankRevealTime: rankRevealTimeIST(),
+      rankRevealNow,
+    };
+
+    if (hasSubmitted && rankRevealNow) {
+      // Include rank info since it's after 5 PM
+      const rankData = {};
+      for (const r of userResults) {
+        const better = await Result.countDocuments({
+          testId: test._id,
+          phase: r.phase,
+          isLate: false,
+          $or: [
+            { score: { $gt: r.score } },
+            { score: r.score, submittedAt: { $lt: r.submittedAt } }
+          ]
+        });
+        const total = await Result.countDocuments({
+          testId: test._id,
+          phase: r.phase,
+          isLate: false
+        });
+        rankData[r.phase] = {
+          score: Math.round(r.score * 100) / 100,
+          correct: r.correct,
+          incorrect: r.incorrect,
+          unattempted: r.unattempted,
+          rank: better + 1,
+          totalParticipants: total
+        };
+      }
+      response.rankData = rankData;
+
+      // Combined rank for Sunday full test
+      if (test.isSundayFullTest && userResults.length === 2) {
+        const combinedScore = userResults.reduce((sum, r) => sum + r.score, 0);
+        const betterCombined = await Result.aggregate([
+          { $match: { testId: test._id, isLate: false, phase: { $in: ["GS", "CSAT"] } } },
+          { $group: { _id: "$userId", total: { $sum: "$score" } } },
+          { $match: { total: { $gt: combinedScore } } },
+          { $count: "count" }
+        ]);
+        const combinedRank = (betterCombined[0]?.count || 0) + 1;
+        const totalUsers = await Result.distinct("userId", {
+          testId: test._id,
+          isLate: false,
+          phase: { $in: ["GS", "CSAT"] }
+        }).then(ids => new Set(ids).size);
+
+        response.combinedRank = {
+          score: Math.round(combinedScore * 100) / 100,
+          rank: combinedRank,
+          totalParticipants: totalUsers
+        };
+      }
+    }
+
+    res.json(response);
+  } catch (err) {
+    console.error("/user/submission-status error:", err.message);
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -260,10 +389,9 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
     }
 
     const now = new Date();
-    const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
-    const nowIST = new Date(now.getTime() + IST_OFFSET_MS);
+    const istNow = nowIST();
     const endIST = new Date(test.endTime.getTime() + IST_OFFSET_MS);
-    const isLate = nowIST > endIST;
+    const isLate = istNow > endIST;
 
     // Prevent multiple on-time submissions for same phase
     const existing = await Result.findOne({
@@ -274,7 +402,8 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
     });
     if (existing) {
       return res.status(403).json({
-        message: `You have already submitted ${phase} phase on time`
+        message: `You have already submitted ${phase} phase. You can only preview your attempt.`,
+        alreadySubmitted: true
       });
     }
 
@@ -315,7 +444,7 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
 
     const score = calculateNetScore(correct, incorrect);
 
-    const result = await Result.create({
+    await Result.create({
       userId: req.user.uid,
       testId: test._id,
       phase,
@@ -331,6 +460,8 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       answers: savedAnswers
     });
 
+    const rankRevealNow = isRankRevealTime();
+
     const responseBase = {
       phase,
       score: Math.round(score * 100) / 100,
@@ -339,7 +470,9 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       unattempted,
       totalQuestions: questions.length,
       isLate,
-      ranked: !isLate
+      ranked: !isLate,
+      rankRevealTime: rankRevealTimeIST(),
+      rankRevealNow,
     };
 
     if (isLate) {
@@ -349,7 +482,15 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       });
     }
 
-    // Calculate phase rank
+    // Only show rank if it's after 5 PM IST
+    if (!rankRevealNow) {
+      return res.json({
+        ...responseBase,
+        message: `Test submitted successfully! Your rank will be available at ${rankRevealTimeIST()} today.`,
+      });
+    }
+
+    // After 5 PM — Calculate and return rank
     const betterCount = await Result.countDocuments({
       testId: test._id,
       phase,
@@ -368,6 +509,7 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
 
     responseBase.rank = betterCount + 1;
     responseBase.totalRankedParticipants = totalRanked;
+    responseBase.message = "Test submitted! Here is your rank.";
 
     // If Sunday test and both phases done → add combined rank
     if (test.isSundayFullTest) {
@@ -426,7 +568,18 @@ app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
       return res.status(404).json({ message: "No on-time ranked attempt found" });
     }
 
-    const response = { phases: {} };
+    const rankRevealNow = isRankRevealTime();
+
+    if (!rankRevealNow) {
+      return res.json({
+        rankRevealNow: false,
+        rankRevealTime: rankRevealTimeIST(),
+        message: `Ranks will be revealed at ${rankRevealTimeIST()} today. Come back then!`,
+        hasSubmitted: true,
+      });
+    }
+
+    const response = { phases: {}, rankRevealNow: true };
 
     for (const r of userResults) {
       const better = await Result.countDocuments({
@@ -494,7 +647,6 @@ app.get("/user/leaderboard/:testId", userAuth, async (req, res) => {
     if (!test) return res.status(404).json({ message: "Test not found" });
 
     if (!test.isSundayFullTest) {
-      // Normal daily test leaderboard
       const results = await Result.find({
         testId: test._id,
         phase: "GS",
@@ -522,7 +674,6 @@ app.get("/user/leaderboard/:testId", userAuth, async (req, res) => {
       });
     }
 
-    // Sunday full test → return both phases + combined
     const gsResults = await Result.find({ testId: test._id, phase: "GS", isLate: false })
       .sort({ score: -1, submittedAt: 1 })
       .limit(20)
@@ -533,7 +684,6 @@ app.get("/user/leaderboard/:testId", userAuth, async (req, res) => {
       .limit(20)
       .lean();
 
-    // Combined leaderboard (top users by total score)
     const combined = await Result.aggregate([
       { $match: { testId: test._id, isLate: false, phase: { $in: ["GS", "CSAT"] } } },
       { $group: {
@@ -585,7 +735,7 @@ app.get("/user/review-test/:testId", userAuth, async (req, res) => {
       return res.status(404).json({ message: "Test not found or not paid" });
     }
 
-    const phase = req.query.phase || "GS"; // optional ?phase=CSAT
+    const phase = req.query.phase || "GS";
 
     let filter = { userId: req.user.uid, testId: test._id };
     if (test.isSundayFullTest) {
@@ -618,8 +768,9 @@ app.get("/user/review-test/:testId", userAuth, async (req, res) => {
       };
     });
 
+    const rankRevealNow = isRankRevealTime();
     let rankInfo = null;
-    if (!result.isLate) {
+    if (!result.isLate && rankRevealNow) {
       const better = await Result.countDocuments({
         testId: test._id,
         phase: result.phase,
@@ -651,11 +802,15 @@ app.get("/user/review-test/:testId", userAuth, async (req, res) => {
       unattempted: result.unattempted,
       submittedAt: result.submittedAt,
       isLate: result.isLate,
+      rankRevealNow,
+      rankRevealTime: rankRevealTimeIST(),
       rankInfo,
       questions: reviewQuestions,
       message: result.isLate
         ? "Late attempt – shown for review/practice only (no rank)"
-        : "Review your answers and performance"
+        : rankRevealNow
+          ? "Review your answers and performance"
+          : `Rank will be available at ${rankRevealTimeIST()}. Come back then!`
     });
   } catch (err) {
     console.error("/user/review-test error:", err.message);
@@ -676,16 +831,14 @@ app.get("/free/tests", async (req, res) => {
       return res.status(404).json({ message: "No free tests available" });
     }
 
-    const IST_OFFSET = 5.5 * 60 * 60 * 1000;
-
     const formatted = tests.map(t => ({
       testId: t._id.toString(),
       title: t.title || "BPSC Free Practice Test",
       date: t.date || "—",
       totalQuestions: t.totalQuestions,
       createdAt: t.createdAt ? new Date(t.createdAt).toISOString() : null,
-      startTimeIST: t.startTime ? new Date(t.startTime.getTime() + IST_OFFSET).toISOString() : null,
-      endTimeIST: t.endTime ? new Date(t.endTime.getTime() + IST_OFFSET).toISOString() : null,
+      startTimeIST: t.startTime ? new Date(t.startTime.getTime() + IST_OFFSET_MS).toISOString() : null,
+      endTimeIST: t.endTime ? new Date(t.endTime.getTime() + IST_OFFSET_MS).toISOString() : null,
     }));
 
     res.json({ success: true, tests: formatted });
@@ -708,8 +861,6 @@ app.get("/free/test/:testId", async (req, res) => {
       .select("-correctOption")
       .lean();
 
-    const IST_OFFSET = 5.5 * 60 * 60 * 1000;
-
     res.json({
       status: "active",
       testId: test._id.toString(),
@@ -726,7 +877,6 @@ app.get("/free/test/:testId", async (req, res) => {
   }
 });
 
-// Legacy endpoint – kept for backward compatibility, now always returns newest free test as active
 app.get("/free/today-test", async (req, res) => {
   try {
     await connectDB();
@@ -742,8 +892,6 @@ app.get("/free/today-test", async (req, res) => {
     const questions = await Question.find({ testId: test._id })
       .select("-correctOption")
       .lean();
-
-    const IST_OFFSET = 5.5 * 60 * 60 * 1000;
 
     res.json({
       status: "active",
