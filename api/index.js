@@ -58,8 +58,10 @@ async function connectDB() {
   return cached.conn;
 }
 
-// Firebase Admin Initialization
+// ─── Firebase Admin Initialization ────────────────────────────────────────
 let firebaseInitialized = false;
+let firestore = null;
+
 if (!admin.apps.length) {
   try {
     const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
@@ -69,13 +71,14 @@ if (!admin.apps.length) {
       credential: admin.credential.cert(serviceAccount)
     });
     firebaseInitialized = true;
+    firestore = admin.firestore();
     console.log("Firebase Admin Initialized successfully");
   } catch (err) {
     console.error("Firebase Admin Initialization FAILED:", err.message);
   }
 }
 
-// ─── SCHEMAS ──────────────────────────────────────────────────────
+// ─── SCHEMAS ──────────────────────────────────────────────────────────────
 const testSchema = new mongoose.Schema({
   title: String,
   date: String,
@@ -131,6 +134,7 @@ const Question = mongoose.models.Question || mongoose.model("Question", question
 const Result = mongoose.models.Result || mongoose.model("Result", resultSchema);
 const FreeResult = mongoose.models.FreeResult || mongoose.model("FreeResult", freeResultSchema);
 
+// ─── Auth Middleware ──────────────────────────────────────────────────────
 const userAuth = async (req, res, next) => {
   if (!firebaseInitialized) return res.status(503).json({ message: "Auth service unavailable" });
   const authHeader = req.headers.authorization;
@@ -145,7 +149,7 @@ const userAuth = async (req, res, next) => {
   }
 };
 
-// ─── HELPERS ──────────────────────────────────────────────────────
+// ─── HELPERS ──────────────────────────────────────────────────────────────
 function calculateNetScore(correct, incorrect) {
   const marksPerCorrect = 2;
   const negativePerWrong = 2 / 3;
@@ -158,12 +162,10 @@ function nowIST() {
   return new Date(Date.now() + IST_OFFSET_MS);
 }
 
-// Rank reveal time: 5:00 PM IST = 17:00
 function isRankRevealTime() {
   const ist = nowIST();
   const hours = ist.getUTCHours();
   const minutes = ist.getUTCMinutes();
-  // 5:00 PM IST = 11:30 UTC
   return (hours > 11) || (hours === 11 && minutes >= 30);
 }
 
@@ -171,7 +173,131 @@ function rankRevealTimeIST() {
   return "5:00 PM IST";
 }
 
-// ─── ROUTES ───────────────────────────────────────────────────────
+// ─── Firestore Analytics Helper ───────────────────────────────────────────
+async function saveAnalyticsToFirestore(uid, payload) {
+  if (!firestore) {
+    console.warn("[Firestore] Firestore not initialized — skipping analytics");
+    return;
+  }
+
+  try {
+    const now = new Date();
+    const todayStr = now.toISOString().split("T")[0];
+
+    let quizType = "paidDaily";
+    if (payload.phase === "GS")   quizType = "paidPhase1";
+    if (payload.phase === "CSAT") quizType = "paidPhase2";
+
+    const percentage = payload.total > 0 ? (payload.correct / payload.total) * 100 : 0;
+    const marksEarned = (payload.correct * 2) - (payload.incorrect * (2 / 3));
+    const negativeMarks = payload.incorrect * (2 / 3);
+
+    const attemptDocId = `${payload.testId}_${Date.now()}`;
+
+    // 1. Individual attempt
+    await firestore
+      .collection("users")
+      .doc(uid)
+      .collection("attempts")
+      .doc(attemptDocId)
+      .set({
+        testId: payload.testId,
+        testTitle: payload.testTitle || `Test ${todayStr}`,
+        quizType: quizType,
+        total: payload.total,
+        correct: payload.correct,
+        incorrect: payload.incorrect,
+        unattempted: payload.unattempted,
+        percentage: percentage,
+        marksEarned: marksEarned,
+        negativeMarks: negativeMarks,
+        timeTakenSeconds: payload.timeTakenSeconds || 0,
+        date: admin.firestore.FieldValue.serverTimestamp(),
+        dateString: todayStr,
+        uid: uid,
+      });
+
+    console.log(`[Firestore] Attempt saved: ${attemptDocId}`);
+
+    // 2. Update summary (transaction)
+    const summaryRef = firestore
+      .collection("users")
+      .doc(uid)
+      .collection("stats")
+      .doc("summary");
+
+    await firestore.runTransaction(async (t) => {
+      const snap = await t.get(summaryRef);
+      const prev = snap.exists ? snap.data() : {};
+
+      const prevTests       = prev.testsGiven ?? 0;
+      const prevCorrect     = prev.totalCorrect ?? 0;
+      const prevIncorrect   = prev.totalIncorrect ?? 0;
+      const prevUnattempted = prev.totalUnattempted ?? 0;
+      const prevTime        = prev.totalTimeTakenSeconds ?? 0;
+      const prevBest        = prev.bestPercentage ?? 0;
+      const prevAvg         = prev.avgPercentage ?? 0;
+
+      const newTests       = prevTests + 1;
+      const newCorrect     = prevCorrect + payload.correct;
+      const newIncorrect   = prevIncorrect + payload.incorrect;
+      const newUnattempted = prevUnattempted + payload.unattempted;
+      const newTime        = prevTime + (payload.timeTakenSeconds || 0);
+      const newBest        = Math.max(prevBest, percentage);
+
+      const newAvg = prevTests === 0
+        ? percentage
+        : ((prevAvg * prevTests) + percentage) / newTests;
+
+      // Basic streak (can be improved later)
+      let currentStreak = prev.currentStreak ?? 0;
+      let longestStreak = prev.longestStreak ?? 0;
+      const lastDateStr = prev.lastTestDateString;
+
+      if (lastDateStr !== todayStr) {
+        currentStreak = 1;
+        longestStreak = Math.max(longestStreak, currentStreak);
+      }
+
+      t.set(summaryRef, {
+        testsGiven: newTests,
+        totalCorrect: newCorrect,
+        totalIncorrect: newIncorrect,
+        totalUnattempted: newUnattempted,
+        totalTimeTakenSeconds: newTime,
+        avgPercentage: newAvg,
+        bestPercentage: newBest,
+        currentStreak,
+        longestStreak,
+        lastTestDateString: todayStr,
+        lastTestDate: admin.firestore.FieldValue.serverTimestamp(),
+        uid: uid,
+      }, { merge: true });
+    });
+
+    console.log(`[Firestore] Summary updated for ${uid}`);
+
+    // 3. Leaderboard
+    const lbRef = firestore.collection("leaderboard").doc(uid);
+    await lbRef.set({
+      uid: uid,
+      name: payload.name || "Anonymous",
+      photo: payload.photo || "",
+      totalCorrect: admin.firestore.FieldValue.increment(payload.correct),
+      totalMarks: admin.firestore.FieldValue.increment(marksEarned),
+      testsGiven: admin.firestore.FieldValue.increment(1),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    console.log(`[Firestore] Leaderboard updated for ${uid}`);
+
+  } catch (err) {
+    console.error("[Firestore Analytics] Error:", err.code || err.message);
+    // Non-blocking — don't crash the API response
+  }
+}
+
+// ─── ROUTES ───────────────────────────────────────────────────────────────
 app.get("/", async (req, res) => {
   try {
     await connectDB();
@@ -202,7 +328,6 @@ app.get("/user/today-test", userAuth, async (req, res) => {
     const startIST = new Date(test.startTime.getTime() + IST_OFFSET_MS);
     const endIST   = new Date(test.endTime.getTime() + IST_OFFSET_MS);
 
-    // Check if user has already submitted (any phase)
     const existingPhases = ["GS"];
     if (test.isSundayFullTest) existingPhases.push("CSAT");
 
@@ -247,7 +372,6 @@ app.get("/user/today-test", userAuth, async (req, res) => {
       });
     }
 
-    // Test is active — fetch questions
     const questions = await Question.find({ testId: test._id })
       .select("-correctOption")
       .sort({ questionNumber: 1 })
@@ -283,11 +407,9 @@ app.get("/user/today-test", userAuth, async (req, res) => {
   }
 });
 
-// ─── NEW: Check submission status for a specific test ─────────────
 app.get("/user/submission-status/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
-
     const test = await Test.findById(req.params.testId);
     if (!test) return res.status(404).json({ message: "Test not found" });
 
@@ -312,7 +434,6 @@ app.get("/user/submission-status/:testId", userAuth, async (req, res) => {
     };
 
     if (hasSubmitted && rankRevealNow) {
-      // Include rank info since it's after 5 PM
       const rankData = {};
       for (const r of userResults) {
         const better = await Result.countDocuments({
@@ -340,7 +461,6 @@ app.get("/user/submission-status/:testId", userAuth, async (req, res) => {
       }
       response.rankData = rankData;
 
-      // Combined rank for Sunday full test
       if (test.isSundayFullTest && userResults.length === 2) {
         const combinedScore = userResults.reduce((sum, r) => sum + r.score, 0);
         const betterCombined = await Result.aggregate([
@@ -375,7 +495,8 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
 
-    const { phase, answers } = req.body;
+    const { phase, answers, timeTakenSeconds } = req.body;
+
     if (!["GS", "CSAT"].includes(phase)) {
       return res.status(400).json({ message: "phase must be 'GS' or 'CSAT'" });
     }
@@ -393,7 +514,6 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
     const endIST = new Date(test.endTime.getTime() + IST_OFFSET_MS);
     const isLate = istNow > endIST;
 
-    // Prevent multiple on-time submissions for same phase
     const existing = await Result.findOne({
       userId: req.user.uid,
       testId: test._id,
@@ -460,6 +580,25 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       answers: savedAnswers
     });
 
+    // ── Save analytics to Firestore (non-blocking) ────────────────────────
+    const analyticsPayload = {
+      testId: req.params.testId,
+      testTitle: test.title,
+      phase: phase,
+      total: questions.length,
+      correct: correct,
+      incorrect: incorrect,
+      unattempted: unattempted,
+      timeTakenSeconds: timeTakenSeconds || 0,
+      name: req.user.name || req.user.email?.split('@')[0] || "Anonymous",
+      photo: req.user.picture || "",
+    };
+
+    // Fire and forget — don't await, don't block response
+    saveAnalyticsToFirestore(req.user.uid, analyticsPayload)
+      .catch(err => console.error("Analytics save failed (non-critical):", err));
+
+    // ── Original response logic continues ─────────────────────────────────
     const rankRevealNow = isRankRevealTime();
 
     const responseBase = {
@@ -482,7 +621,6 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       });
     }
 
-    // Only show rank if it's after 5 PM IST
     if (!rankRevealNow) {
       return res.json({
         ...responseBase,
@@ -490,7 +628,6 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       });
     }
 
-    // After 5 PM — Calculate and return rank
     const betterCount = await Result.countDocuments({
       testId: test._id,
       phase,
@@ -511,7 +648,6 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
     responseBase.totalRankedParticipants = totalRanked;
     responseBase.message = "Test submitted! Here is your rank.";
 
-    // If Sunday test and both phases done → add combined rank
     if (test.isSundayFullTest) {
       const gsResult   = await Result.findOne({ userId: req.user.uid, testId: test._id, phase: "GS",   isLate: false });
       const csatResult = await Result.findOne({ userId: req.user.uid, testId: test._id, phase: "CSAT", isLate: false });
@@ -551,7 +687,6 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
 app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
-
     const test = await Test.findById(req.params.testId);
     if (!test) return res.status(404).json({ message: "Test not found" });
 
@@ -608,7 +743,6 @@ app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
       };
     }
 
-    // Combined rank for Sunday
     if (test.isSundayFullTest && userResults.length === 2) {
       const combinedScore = userResults.reduce((sum, r) => sum + r.score, 0);
 
@@ -868,7 +1002,7 @@ app.get("/free/test/:testId", async (req, res) => {
       totalQuestions: test.totalQuestions,
       date: test.date,
       questions,
-      note: "Persistent free practice test — available anytime until removed by admin",
+      note: "Persistent free practice test ",
       isPersistentFreeTest: true
     });
   } catch (err) {
@@ -900,7 +1034,7 @@ app.get("/free/today-test", async (req, res) => {
       totalQuestions: test.totalQuestions,
       date: test.date,
       questions,
-      note: "Persistent free practice test — available anytime until removed by admin",
+      note: "Persistent free practice test",
       isPersistentFreeTest: true
     });
   } catch (err) {
