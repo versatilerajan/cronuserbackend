@@ -395,6 +395,7 @@ app.get("/user/analytics/attempts", userAuth, async (req, res) => {
     res.json(attempts.map(a => ({
       _id: a._id.toString(),
       testId: a.testId.toString(),
+      testTitle: a.testTitle || `Test ${a.testId.toString().substring(0, 8)}`,
       phase: a.phase,
       score: a.score,
       correct: a.correct,
