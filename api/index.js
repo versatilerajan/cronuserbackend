@@ -58,7 +58,6 @@ async function connectDB() {
   return cached.conn;
 }
 
-// Firebase Admin — only for Authentication (verifyIdToken), no Firestore
 let firebaseInitialized = false;
 if (!admin.apps.length) {
   try {
@@ -75,7 +74,6 @@ if (!admin.apps.length) {
   }
 }
 
-// ─── SCHEMAS ──────────────────────────────────────────────────────
 const testSchema = new mongoose.Schema({
   title: String,
   date: String,
@@ -117,7 +115,7 @@ const resultSchema = new mongoose.Schema({
     questionId: String,
     selectedOption: String
   }],
-  timeTakenSeconds: { type: Number, default: 0 } // Added for analytics
+  timeTakenSeconds: { type: Number, default: 0 }
 }, { timestamps: true });
 
 const freeResultSchema = new mongoose.Schema({
@@ -132,7 +130,6 @@ const Question = mongoose.models.Question || mongoose.model("Question", question
 const Result = mongoose.models.Result || mongoose.model("Result", resultSchema);
 const FreeResult = mongoose.models.FreeResult || mongoose.model("FreeResult", freeResultSchema);
 
-// ─── Auth Middleware ──────────────────────────────────────────────────────
 const userAuth = async (req, res, next) => {
   if (!firebaseInitialized) return res.status(503).json({ message: "Auth service unavailable" });
   const authHeader = req.headers.authorization;
@@ -147,7 +144,6 @@ const userAuth = async (req, res, next) => {
   }
 };
 
-// ─── HELPERS ──────────────────────────────────────────────────────────────
 function calculateNetScore(correct, incorrect) {
   const marksPerCorrect = 2;
   const negativePerWrong = 2 / 3;
@@ -171,96 +167,6 @@ function rankRevealTimeIST() {
   return "5:00 PM IST";
 }
 
-// ─── NEW ANALYTICS ENDPOINTS (MongoDB only) ───────────────────────────────
-
-// Get summary stats for current user
-app.get("/user/analytics/summary", userAuth, async (req, res) => {
-  try {
-    await connectDB();
-    const uid = req.user.uid;
-
-    const results = await Result.find({ userId: uid, isLate: false }).lean();
-
-    if (results.length === 0) {
-      return res.json({
-        testsGiven: 0,
-        totalCorrect: 0,
-        totalIncorrect: 0,
-        totalUnattempted: 0,
-        totalTimeTakenSeconds: 0,
-        avgPercentage: 0,
-        bestPercentage: 0,
-        currentStreak: 0,
-        longestStreak: 0,
-      });
-    }
-
-    let totalCorrect = 0;
-    let totalIncorrect = 0;
-    let totalUnattempted = 0;
-    let totalTime = 0;
-    let bestPct = 0;
-    let sumPct = 0;
-
-    const dates = new Set();
-
-    results.forEach(r => {
-      totalCorrect += r.correct || 0;
-      totalIncorrect += r.incorrect || 0;
-      totalUnattempted += r.unattempted || 0;
-      totalTime += r.timeTakenSeconds || 0;
-
-      const pct = r.totalQuestions > 0 ? (r.correct / r.totalQuestions) * 100 : 0;
-      sumPct += pct;
-      bestPct = Math.max(bestPct, pct);
-
-      const dateStr = r.submittedAt.toISOString().split('T')[0];
-      dates.add(dateStr);
-    });
-
-    const testsGiven = results.length;
-    const avgPercentage = testsGiven > 0 ? sumPct / testsGiven : 0;
-
-    // Basic streak calculation
-    const sortedDates = [...dates].sort();
-    let currentStreak = 0;
-    let longestStreak = 0;
-    let prevDate = null;
-
-    for (const d of sortedDates) {
-      const curr = new Date(d);
-      if (prevDate) {
-        const diffDays = Math.round((curr - prevDate) / (1000 * 60 * 60 * 24));
-        if (diffDays === 1) {
-          currentStreak++;
-        } else {
-          currentStreak = 1;
-        }
-      } else {
-        currentStreak = 1;
-      }
-      longestStreak = Math.max(longestStreak, currentStreak);
-      prevDate = curr;
-    }
-
-    res.json({
-      testsGiven,
-      totalCorrect,
-      totalIncorrect,
-      totalUnattempted,
-      totalTimeTakenSeconds: totalTime,
-      avgPercentage: Math.round(avgPercentage * 10) / 10,
-      bestPercentage: Math.round(bestPct * 10) / 10,
-      currentStreak,
-      longestStreak,
-    });
-  } catch (err) {
-    console.error("/user/analytics/summary error:", err.message);
-    res.status(500).json({ message: "Failed to fetch analytics summary" });
-  }
-});
-
-// ─── ANALYTICS SUMMARY ──────────────────────────────────────────────────────
 app.get("/user/analytics/summary", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -311,7 +217,6 @@ app.get("/user/analytics/summary", userAuth, async (req, res) => {
       const dateStr = r.submittedAt.toISOString().split('T')[0];
       dates.add(dateStr);
 
-      // Classify quiz type
       let qtKey = 'paidDaily';
       if (r.phase === 'GS' && r.totalQuestions === 100) qtKey = 'paidPhase1';
       if (r.phase === 'CSAT') qtKey = 'paidPhase2';
@@ -323,14 +228,12 @@ app.get("/user/analytics/summary", userAuth, async (req, res) => {
       qt.totalMarks += (r.correct * 2) - (r.incorrect * (2 / 3));
       qt.bestPercentage = Math.max(qt.bestPercentage, pct);
 
-      // Time tracking
       const timeSec = r.timeTakenSeconds || 0;
       qt.totalTimeSeconds += timeSec;
       if (qt.minTimeSeconds === undefined || timeSec < qt.minTimeSeconds) qt.minTimeSeconds = timeSec;
       if (qt.maxTimeSeconds === undefined || timeSec > qt.maxTimeSeconds) qt.maxTimeSeconds = timeSec;
     });
 
-    // Calculate averages
     Object.values(quizTypeStats).forEach(qt => {
       if (qt.count > 0) {
         qt.avgPercentage = (qt.totalCorrect / (qt.totalCorrect + qt.totalIncorrect)) * 100 || 0;
@@ -343,7 +246,6 @@ app.get("/user/analytics/summary", userAuth, async (req, res) => {
     const testsGiven = results.length;
     const avgPercentage = testsGiven > 0 ? sumPct / testsGiven : 0;
 
-    // Streak calculation
     const sortedDates = [...dates].sort();
     let currentStreak = 0;
     let longestStreak = 0;
@@ -380,7 +282,6 @@ app.get("/user/analytics/summary", userAuth, async (req, res) => {
   }
 });
 
-// Get recent attempts (history)
 app.get("/user/analytics/attempts", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -411,9 +312,6 @@ app.get("/user/analytics/attempts", userAuth, async (req, res) => {
   }
 });
 
-// ─── ALL YOUR ORIGINAL ROUTES (unchanged) ─────────────────────────────────
-
-// Root check
 app.get("/", async (req, res) => {
   try {
     await connectDB();
@@ -429,7 +327,6 @@ app.get("/", async (req, res) => {
   }
 });
 
-// Today's paid test
 app.get("/user/today-test", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -524,7 +421,6 @@ app.get("/user/today-test", userAuth, async (req, res) => {
   }
 });
 
-// Submission status
 app.get("/user/submission-status/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -609,13 +505,11 @@ app.get("/user/submission-status/:testId", userAuth, async (req, res) => {
   }
 });
 
-// ─── OVERALL USER RANK (across all paid tests) ───────────────────────────────
 app.get("/user/overall-rank", userAuth, async (req, res) => {
   try {
     await connectDB();
     const uid = req.user.uid;
 
-    // Get all non-late paid attempts for this user
     const userResults = await Result.find({ userId: uid, isLate: false }).lean();
 
     if (userResults.length === 0) {
@@ -628,7 +522,6 @@ app.get("/user/overall-rank", userAuth, async (req, res) => {
       });
     }
 
-    // Calculate user's total performance
     let totalMarks = 0;
     let totalCorrect = 0;
     let testsGiven = userResults.length;
@@ -638,7 +531,6 @@ app.get("/user/overall-rank", userAuth, async (req, res) => {
       totalCorrect += r.correct || 0;
     });
 
-    // Count how many users have better total marks
     const betterUsers = await Result.aggregate([
       {
         $match: { isLate: false }
@@ -661,7 +553,6 @@ app.get("/user/overall-rank", userAuth, async (req, res) => {
 
     const rank = (betterUsers[0]?.count || 0) + 1;
 
-    // Total unique participants (approx)
     const totalParticipants = await Result.distinct("userId", { isLate: false }).then(ids => new Set(ids).size);
 
     res.json({
@@ -680,7 +571,6 @@ app.get("/user/overall-rank", userAuth, async (req, res) => {
   }
 });
 
-// ─── GLOBAL LEADERBOARD (top users across all tests) ─────────────────────────
 app.get("/leaderboard/global", async (req, res) => {
   try {
     await connectDB();
@@ -706,12 +596,11 @@ app.get("/leaderboard/global", async (req, res) => {
           totalMarks: { $round: ["$totalMarks", 2] },
           totalCorrect: 1,
           testsGiven: 1,
-          rank: { $literal: 0 } // will fill later
+          rank: { $literal: 0 }
         }
       }
     ]);
 
-    // Add rank numbers
     leaderboard.forEach((entry, index) => {
       entry.rank = index + 1;
     });
@@ -726,7 +615,6 @@ app.get("/leaderboard/global", async (req, res) => {
   }
 });
 
-// Submit paid test
 app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -814,7 +702,7 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       startedAt: now,
       isLate,
       answers: savedAnswers,
-      timeTakenSeconds: timeTakenSeconds || 0 // save time for analytics
+      timeTakenSeconds: timeTakenSeconds || 0
     });
 
     const rankRevealNow = isRankRevealTime();
@@ -902,7 +790,6 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
   }
 });
 
-// My rank
 app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -993,7 +880,6 @@ app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
   }
 });
 
-// Leaderboard
 app.get("/user/leaderboard/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -1081,7 +967,6 @@ app.get("/user/leaderboard/:testId", userAuth, async (req, res) => {
   }
 });
 
-// Review test
 app.get("/user/review-test/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -1172,8 +1057,6 @@ app.get("/user/review-test/:testId", userAuth, async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 });
-
-// ─── FREE TEST ROUTES (unchanged) ─────────────────────────────────────────
 
 app.get("/free/tests", async (req, res) => {
   try {
@@ -1336,5 +1219,4 @@ app.get("/free/leaderboard/:testId", async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 });
-
 module.exports = app;
