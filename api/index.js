@@ -51,17 +51,15 @@ async function connectDB() {
   cached.conn = await cached.promise;
 
   await mongoose.model("Result").collection.createIndex(
-    { testId: 1, phase: 1, isLate: 1, score: -1, submittedAt: 1 },
+    { userId: 1, testId: 1, phase: 1, isLate: 1, score: -1, submittedAt: -1 },
     { background: true }
   );
 
   return cached.conn;
 }
 
-// ─── Firebase Admin Initialization ────────────────────────────────────────
+// Firebase Admin — only for Authentication (verifyIdToken), no Firestore
 let firebaseInitialized = false;
-let firestore = null;
-
 if (!admin.apps.length) {
   try {
     const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
@@ -71,14 +69,13 @@ if (!admin.apps.length) {
       credential: admin.credential.cert(serviceAccount)
     });
     firebaseInitialized = true;
-    firestore = admin.firestore();
-    console.log("Firebase Admin Initialized successfully");
+    console.log("Firebase Admin Initialized successfully (Auth only)");
   } catch (err) {
     console.error("Firebase Admin Initialization FAILED:", err.message);
   }
 }
 
-// ─── SCHEMAS ──────────────────────────────────────────────────────────────
+// ─── SCHEMAS ──────────────────────────────────────────────────────
 const testSchema = new mongoose.Schema({
   title: String,
   date: String,
@@ -119,7 +116,8 @@ const resultSchema = new mongoose.Schema({
   answers: [{
     questionId: String,
     selectedOption: String
-  }]
+  }],
+  timeTakenSeconds: { type: Number, default: 0 } // Added for analytics
 }, { timestamps: true });
 
 const freeResultSchema = new mongoose.Schema({
@@ -173,131 +171,128 @@ function rankRevealTimeIST() {
   return "5:00 PM IST";
 }
 
-// ─── Firestore Analytics Helper ───────────────────────────────────────────
-async function saveAnalyticsToFirestore(uid, payload) {
-  if (!firestore) {
-    console.warn("[Firestore] Firestore not initialized — skipping analytics save");
-    return;
-  }
+// ─── NEW ANALYTICS ENDPOINTS (MongoDB only) ───────────────────────────────
 
+// Get summary stats for current user
+app.get("/user/analytics/summary", userAuth, async (req, res) => {
   try {
-    const now = new Date();
-    const todayStr = now.toISOString().split("T")[0];
+    await connectDB();
+    const uid = req.user.uid;
 
-    let quizType = "paidDaily";
-    if (payload.phase === "GS")   quizType = "paidPhase1";
-    if (payload.phase === "CSAT") quizType = "paidPhase2";
+    const results = await Result.find({ userId: uid, isLate: false }).lean();
 
-    const percentage = payload.total > 0 ? (payload.correct / payload.total) * 100 : 0;
-    const marksEarned = (payload.correct * 2) - (payload.incorrect * (2 / 3));
-    const negativeMarks = payload.incorrect * (2 / 3);
-
-    const attemptDocId = `${payload.testId}_${Date.now()}`;
-
-    // 1. Save individual attempt
-    await firestore
-      .collection("users")
-      .doc(uid)
-      .collection("attempts")
-      .doc(attemptDocId)
-      .set({
-        testId: payload.testId,
-        testTitle: payload.testTitle || `Test ${todayStr}`,
-        quizType: quizType,
-        total: payload.total,
-        correct: payload.correct,
-        incorrect: payload.incorrect,
-        unattempted: payload.unattempted,
-        percentage: percentage,
-        marksEarned: marksEarned,
-        negativeMarks: negativeMarks,
-        timeTakenSeconds: payload.timeTakenSeconds || 0,
-        date: admin.firestore.FieldValue.serverTimestamp(),
-        dateString: todayStr,
-        uid: uid,
+    if (results.length === 0) {
+      return res.json({
+        testsGiven: 0,
+        totalCorrect: 0,
+        totalIncorrect: 0,
+        totalUnattempted: 0,
+        totalTimeTakenSeconds: 0,
+        avgPercentage: 0,
+        bestPercentage: 0,
+        currentStreak: 0,
+        longestStreak: 0,
       });
+    }
 
-    console.log(`[Firestore] Attempt saved: ${attemptDocId}`);
+    let totalCorrect = 0;
+    let totalIncorrect = 0;
+    let totalUnattempted = 0;
+    let totalTime = 0;
+    let bestPct = 0;
+    let sumPct = 0;
 
-    // 2. Update summary stats with transaction
-    const summaryRef = firestore
-      .collection("users")
-      .doc(uid)
-      .collection("stats")
-      .doc("summary");
+    const dates = new Set();
 
-    await firestore.runTransaction(async (t) => {
-      const snap = await t.get(summaryRef);
-      const prev = snap.exists ? snap.data() : {};
+    results.forEach(r => {
+      totalCorrect += r.correct || 0;
+      totalIncorrect += r.incorrect || 0;
+      totalUnattempted += r.unattempted || 0;
+      totalTime += r.timeTakenSeconds || 0;
 
-      const prevTests       = prev.testsGiven ?? 0;
-      const prevCorrect     = prev.totalCorrect ?? 0;
-      const prevIncorrect   = prev.totalIncorrect ?? 0;
-      const prevUnattempted = prev.totalUnattempted ?? 0;
-      const prevTime        = prev.totalTimeTakenSeconds ?? 0;
-      const prevBest        = prev.bestPercentage ?? 0;
-      const prevAvg         = prev.avgPercentage ?? 0;
+      const pct = r.totalQuestions > 0 ? (r.correct / r.totalQuestions) * 100 : 0;
+      sumPct += pct;
+      bestPct = Math.max(bestPct, pct);
 
-      const newTests       = prevTests + 1;
-      const newCorrect     = prevCorrect + payload.correct;
-      const newIncorrect   = prevIncorrect + payload.incorrect;
-      const newUnattempted = prevUnattempted + payload.unattempted;
-      const newTime        = prevTime + (payload.timeTakenSeconds || 0);
-      const newBest        = Math.max(prevBest, percentage);
-
-      const newAvg = prevTests === 0
-        ? percentage
-        : ((prevAvg * prevTests) + percentage) / newTests;
-
-      // Basic streak logic (you can improve it later)
-      let currentStreak = prev.currentStreak ?? 0;
-      let longestStreak = prev.longestStreak ?? 0;
-      const lastDateStr = prev.lastTestDateString;
-
-      if (lastDateStr !== todayStr) {
-        currentStreak = 1; // simplified version
-        longestStreak = Math.max(longestStreak, currentStreak);
-      }
-
-      t.set(summaryRef, {
-        testsGiven: newTests,
-        totalCorrect: newCorrect,
-        totalIncorrect: newIncorrect,
-        totalUnattempted: newUnattempted,
-        totalTimeTakenSeconds: newTime,
-        avgPercentage: newAvg,
-        bestPercentage: newBest,
-        currentStreak,
-        longestStreak,
-        lastTestDateString: todayStr,
-        lastTestDate: admin.firestore.FieldValue.serverTimestamp(),
-        uid: uid,
-      }, { merge: true });
+      const dateStr = r.submittedAt.toISOString().split('T')[0];
+      dates.add(dateStr);
     });
 
-    console.log(`[Firestore] Summary updated for user ${uid}`);
+    const testsGiven = results.length;
+    const avgPercentage = testsGiven > 0 ? sumPct / testsGiven : 0;
 
-    // 3. Update leaderboard (atomic increment)
-    const lbRef = firestore.collection("leaderboard").doc(uid);
-    await lbRef.set({
-      uid: uid,
-      name: payload.name || "Anonymous",
-      photo: payload.photo || "",
-      totalCorrect: admin.firestore.FieldValue.increment(payload.correct),
-      totalMarks: admin.firestore.FieldValue.increment(marksEarned),
-      testsGiven: admin.firestore.FieldValue.increment(1),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
+    // Basic streak calculation
+    const sortedDates = [...dates].sort();
+    let currentStreak = 0;
+    let longestStreak = 0;
+    let prevDate = null;
 
-    console.log(`[Firestore] Leaderboard updated for ${uid}`);
+    for (const d of sortedDates) {
+      const curr = new Date(d);
+      if (prevDate) {
+        const diffDays = Math.round((curr - prevDate) / (1000 * 60 * 60 * 24));
+        if (diffDays === 1) {
+          currentStreak++;
+        } else {
+          currentStreak = 1;
+        }
+      } else {
+        currentStreak = 1;
+      }
+      longestStreak = Math.max(longestStreak, currentStreak);
+      prevDate = curr;
+    }
 
+    res.json({
+      testsGiven,
+      totalCorrect,
+      totalIncorrect,
+      totalUnattempted,
+      totalTimeTakenSeconds: totalTime,
+      avgPercentage: Math.round(avgPercentage * 10) / 10,
+      bestPercentage: Math.round(bestPct * 10) / 10,
+      currentStreak,
+      longestStreak,
+    });
   } catch (err) {
-    console.error("[Firestore Analytics] Error:", err.code || err.message);
-    // Non-blocking — do not throw
+    console.error("/user/analytics/summary error:", err.message);
+    res.status(500).json({ message: "Failed to fetch analytics summary" });
   }
-}
+});
 
-// ─── ROUTES ───────────────────────────────────────────────────────────────
+// Get recent attempts (history)
+app.get("/user/analytics/attempts", userAuth, async (req, res) => {
+  try {
+    await connectDB();
+    const uid = req.user.uid;
+    const limit = parseInt(req.query.limit) || 30;
+
+    const attempts = await Result.find({ userId: uid, isLate: false })
+      .sort({ submittedAt: -1 })
+      .limit(limit)
+      .lean();
+
+    res.json(attempts.map(a => ({
+      _id: a._id.toString(),
+      testId: a.testId.toString(),
+      phase: a.phase,
+      score: a.score,
+      correct: a.correct,
+      incorrect: a.incorrect,
+      unattempted: a.unattempted,
+      totalQuestions: a.totalQuestions,
+      submittedAt: a.submittedAt.toISOString(),
+      timeTakenSeconds: a.timeTakenSeconds || 0,
+    })));
+  } catch (err) {
+    console.error("/user/analytics/attempts error:", err.message);
+    res.status(500).json({ message: "Failed to fetch attempts" });
+  }
+});
+
+// ─── ALL YOUR ORIGINAL ROUTES (unchanged) ─────────────────────────────────
+
+// Root check
 app.get("/", async (req, res) => {
   try {
     await connectDB();
@@ -313,6 +308,7 @@ app.get("/", async (req, res) => {
   }
 });
 
+// Today's paid test
 app.get("/user/today-test", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -407,6 +403,7 @@ app.get("/user/today-test", userAuth, async (req, res) => {
   }
 });
 
+// Submission status
 app.get("/user/submission-status/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -491,6 +488,7 @@ app.get("/user/submission-status/:testId", userAuth, async (req, res) => {
   }
 });
 
+// Submit paid test
 app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -577,28 +575,10 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       submittedAt: now,
       startedAt: now,
       isLate,
-      answers: savedAnswers
+      answers: savedAnswers,
+      timeTakenSeconds: timeTakenSeconds || 0 // save time for analytics
     });
 
-    // ── Save to Firestore Analytics (non-blocking) ────────────────────────
-    const analyticsPayload = {
-      testId: req.params.testId,
-      testTitle: test.title,
-      phase: phase,
-      total: questions.length,
-      correct: correct,
-      incorrect: incorrect,
-      unattempted: unattempted,
-      timeTakenSeconds: timeTakenSeconds || 0,
-      name: req.user.name || req.user.email?.split('@')[0] || "Anonymous",
-      photo: req.user.picture || "",
-    };
-
-    // Fire and forget — do not await, do not block user response
-    saveAnalyticsToFirestore(req.user.uid, analyticsPayload)
-      .catch(err => console.error("Analytics save failed (non-critical):", err));
-
-    // ── Continue with original response logic ─────────────────────────────
     const rankRevealNow = isRankRevealTime();
 
     const responseBase = {
@@ -684,6 +664,7 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
   }
 });
 
+// My rank
 app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -774,6 +755,7 @@ app.get("/user/my-rank/:testId", userAuth, async (req, res) => {
   }
 });
 
+// Leaderboard
 app.get("/user/leaderboard/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -861,6 +843,7 @@ app.get("/user/leaderboard/:testId", userAuth, async (req, res) => {
   }
 });
 
+// Review test
 app.get("/user/review-test/:testId", userAuth, async (req, res) => {
   try {
     await connectDB();
@@ -951,6 +934,8 @@ app.get("/user/review-test/:testId", userAuth, async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 });
+
+// ─── FREE TEST ROUTES (unchanged) ─────────────────────────────────────────
 
 app.get("/free/tests", async (req, res) => {
   try {
