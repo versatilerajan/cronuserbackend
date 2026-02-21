@@ -176,7 +176,7 @@ function rankRevealTimeIST() {
 // ─── Firestore Analytics Helper ───────────────────────────────────────────
 async function saveAnalyticsToFirestore(uid, payload) {
   if (!firestore) {
-    console.warn("[Firestore] Firestore not initialized — skipping analytics");
+    console.warn("[Firestore] Firestore not initialized — skipping analytics save");
     return;
   }
 
@@ -194,7 +194,7 @@ async function saveAnalyticsToFirestore(uid, payload) {
 
     const attemptDocId = `${payload.testId}_${Date.now()}`;
 
-    // 1. Individual attempt
+    // 1. Save individual attempt
     await firestore
       .collection("users")
       .doc(uid)
@@ -219,7 +219,7 @@ async function saveAnalyticsToFirestore(uid, payload) {
 
     console.log(`[Firestore] Attempt saved: ${attemptDocId}`);
 
-    // 2. Update summary (transaction)
+    // 2. Update summary stats with transaction
     const summaryRef = firestore
       .collection("users")
       .doc(uid)
@@ -249,13 +249,13 @@ async function saveAnalyticsToFirestore(uid, payload) {
         ? percentage
         : ((prevAvg * prevTests) + percentage) / newTests;
 
-      // Basic streak (can be improved later)
+      // Basic streak logic (you can improve it later)
       let currentStreak = prev.currentStreak ?? 0;
       let longestStreak = prev.longestStreak ?? 0;
       const lastDateStr = prev.lastTestDateString;
 
       if (lastDateStr !== todayStr) {
-        currentStreak = 1;
+        currentStreak = 1; // simplified version
         longestStreak = Math.max(longestStreak, currentStreak);
       }
 
@@ -275,9 +275,9 @@ async function saveAnalyticsToFirestore(uid, payload) {
       }, { merge: true });
     });
 
-    console.log(`[Firestore] Summary updated for ${uid}`);
+    console.log(`[Firestore] Summary updated for user ${uid}`);
 
-    // 3. Leaderboard
+    // 3. Update leaderboard (atomic increment)
     const lbRef = firestore.collection("leaderboard").doc(uid);
     await lbRef.set({
       uid: uid,
@@ -293,7 +293,7 @@ async function saveAnalyticsToFirestore(uid, payload) {
 
   } catch (err) {
     console.error("[Firestore Analytics] Error:", err.code || err.message);
-    // Non-blocking — don't crash the API response
+    // Non-blocking — do not throw
   }
 }
 
@@ -580,7 +580,7 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       answers: savedAnswers
     });
 
-    // ── Save analytics to Firestore (non-blocking) ────────────────────────
+    // ── Save to Firestore Analytics (non-blocking) ────────────────────────
     const analyticsPayload = {
       testId: req.params.testId,
       testTitle: test.title,
@@ -594,11 +594,11 @@ app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
       photo: req.user.picture || "",
     };
 
-    // Fire and forget — don't await, don't block response
+    // Fire and forget — do not await, do not block user response
     saveAnalyticsToFirestore(req.user.uid, analyticsPayload)
       .catch(err => console.error("Analytics save failed (non-critical):", err));
 
-    // ── Original response logic continues ─────────────────────────────────
+    // ── Continue with original response logic ─────────────────────────────
     const rankRevealNow = isRankRevealTime();
 
     const responseBase = {
@@ -1002,7 +1002,7 @@ app.get("/free/test/:testId", async (req, res) => {
       totalQuestions: test.totalQuestions,
       date: test.date,
       questions,
-      note: "Persistent free practice test ",
+      note: "Persistent free practice test — available anytime until removed by admin",
       isPersistentFreeTest: true
     });
   } catch (err) {
@@ -1034,7 +1034,7 @@ app.get("/free/today-test", async (req, res) => {
       totalQuestions: test.totalQuestions,
       date: test.date,
       questions,
-      note: "Persistent free practice test",
+      note: "Persistent free practice test — available anytime until removed by admin",
       isPersistentFreeTest: true
     });
   } catch (err) {
@@ -1046,7 +1046,7 @@ app.get("/free/today-test", async (req, res) => {
 app.post("/free/submit-test/:testId", async (req, res) => {
   try {
     await connectDB();
-    const { answers } = req.body;
+    const { answers, timeTakenSeconds } = req.body;
     if (!Array.isArray(answers)) return res.status(400).json({ message: "answers must be array" });
 
     const questions = await Question.find({ testId: req.params.testId });
