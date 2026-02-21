@@ -488,6 +488,123 @@ app.get("/user/submission-status/:testId", userAuth, async (req, res) => {
   }
 });
 
+// ─── OVERALL USER RANK (across all paid tests) ───────────────────────────────
+app.get("/user/overall-rank", userAuth, async (req, res) => {
+  try {
+    await connectDB();
+    const uid = req.user.uid;
+
+    // Get all non-late paid attempts for this user
+    const userResults = await Result.find({ userId: uid, isLate: false }).lean();
+
+    if (userResults.length === 0) {
+      return res.json({
+        hasRank: false,
+        message: "Complete at least one paid test to see your overall rank.",
+        totalMarks: 0,
+        totalCorrect: 0,
+        testsGiven: 0,
+      });
+    }
+
+    // Calculate user's total performance
+    let totalMarks = 0;
+    let totalCorrect = 0;
+    let testsGiven = userResults.length;
+
+    userResults.forEach(r => {
+      totalMarks += (r.correct * 2) - (r.incorrect * (2 / 3));
+      totalCorrect += r.correct || 0;
+    });
+
+    // Count how many users have better total marks
+    const betterUsers = await Result.aggregate([
+      {
+        $match: { isLate: false }
+      },
+      {
+        $group: {
+          _id: "$userId",
+          totalMarks: {
+            $sum: { $subtract: [{ $multiply: ["$correct", 2] }, { $multiply: ["$incorrect", 2 / 3] }] }
+          }
+        }
+      },
+      {
+        $match: { totalMarks: { $gt: totalMarks } }
+      },
+      {
+        $count: "count"
+      }
+    ]);
+
+    const rank = (betterUsers[0]?.count || 0) + 1;
+
+    // Total unique participants (approx)
+    const totalParticipants = await Result.distinct("userId", { isLate: false }).then(ids => new Set(ids).size);
+
+    res.json({
+      hasRank: true,
+      rank,
+      totalMarks: Math.round(totalMarks * 100) / 100,
+      totalCorrect,
+      testsGiven,
+      totalParticipants,
+      percentile: totalParticipants > 0 ? Math.round(((totalParticipants - rank) / totalParticipants) * 100) : 0,
+      message: `Your overall rank among all participants`
+    });
+  } catch (err) {
+    console.error("/user/overall-rank error:", err.message);
+    res.status(500).json({ message: "Failed to calculate overall rank" });
+  }
+});
+
+// ─── GLOBAL LEADERBOARD (top users across all tests) ─────────────────────────
+app.get("/leaderboard/global", async (req, res) => {
+  try {
+    await connectDB();
+    const limit = parseInt(req.query.limit) || 50;
+
+    const leaderboard = await Result.aggregate([
+      { $match: { isLate: false } },
+      {
+        $group: {
+          _id: "$userId",
+          totalMarks: {
+            $sum: { $subtract: [{ $multiply: ["$correct", 2] }, { $multiply: ["$incorrect", 2 / 3] }] }
+          },
+          totalCorrect: { $sum: "$correct" },
+          testsGiven: { $sum: 1 }
+        }
+      },
+      { $sort: { totalMarks: -1 } },
+      { $limit: limit },
+      {
+        $project: {
+          userId: "$_id",
+          totalMarks: { $round: ["$totalMarks", 2] },
+          totalCorrect: 1,
+          testsGiven: 1,
+          rank: { $literal: 0 } // will fill later
+        }
+      }
+    ]);
+
+    // Add rank numbers
+    leaderboard.forEach((entry, index) => {
+      entry.rank = index + 1;
+    });
+
+    res.json({
+      leaderboard,
+      totalParticipants: await Result.distinct("userId", { isLate: false }).then(ids => new Set(ids).size)
+    });
+  } catch (err) {
+    console.error("/leaderboard/global error:", err.message);
+    res.status(500).json({ message: "Failed to fetch global leaderboard" });
+  }
+});
+
 // Submit paid test
 app.post("/user/submit-test/:testId", userAuth, async (req, res) => {
   try {
