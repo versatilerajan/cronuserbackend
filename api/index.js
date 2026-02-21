@@ -260,6 +260,118 @@ app.get("/user/analytics/summary", userAuth, async (req, res) => {
   }
 });
 
+// ─── ANALYTICS SUMMARY ──────────────────────────────────────────────────────
+app.get("/user/analytics/summary", userAuth, async (req, res) => {
+  try {
+    await connectDB();
+    const uid = req.user.uid;
+
+    const results = await Result.find({ userId: uid, isLate: false }).lean();
+
+    if (results.length === 0) {
+      return res.json({
+        testsGiven: 0,
+        totalCorrect: 0,
+        totalIncorrect: 0,
+        totalUnattempted: 0,
+        totalTimeTakenSeconds: 0,
+        avgPercentage: 0,
+        bestPercentage: 0,
+        currentStreak: 0,
+        longestStreak: 0,
+        quizTypeStats: {}, // empty
+      });
+    }
+
+    let totalCorrect = 0;
+    let totalIncorrect = 0;
+    let totalUnattempted = 0;
+    let totalTime = 0;
+    let bestPct = 0;
+    let sumPct = 0;
+
+    const dates = new Set();
+
+    // ── Quiz type stats ────────────────────────────────────────────────────
+    const quizTypeStats = {
+      paidDaily:  { count: 0, totalCorrect: 0, totalIncorrect: 0, totalMarks: 0, bestPercentage: 0, avgPercentage: 0 },
+      paidPhase1: { count: 0, totalCorrect: 0, totalIncorrect: 0, totalMarks: 0, bestPercentage: 0, avgPercentage: 0 },
+      paidPhase2: { count: 0, totalCorrect: 0, totalIncorrect: 0, totalMarks: 0, bestPercentage: 0, avgPercentage: 0 },
+    };
+
+    results.forEach(r => {
+      totalCorrect += r.correct || 0;
+      totalIncorrect += r.incorrect || 0;
+      totalUnattempted += r.unattempted || 0;
+      totalTime += r.timeTakenSeconds || 0;
+
+      const pct = r.totalQuestions > 0 ? (r.correct / r.totalQuestions) * 100 : 0;
+      sumPct += pct;
+      bestPct = Math.max(bestPct, pct);
+
+      const dateStr = r.submittedAt.toISOString().split('T')[0];
+      dates.add(dateStr);
+
+      // ── Classify quiz type ─────────────────────────────────────────────
+      let qtKey = 'paidDaily';
+      if (r.phase === 'GS' && r.totalQuestions === 100) qtKey = 'paidPhase1';
+      if (r.phase === 'CSAT') qtKey = 'paidPhase2';
+
+      const qt = quizTypeStats[qtKey];
+      qt.count++;
+      qt.totalCorrect += r.correct || 0;
+      qt.totalIncorrect += r.incorrect || 0;
+      qt.totalMarks += (r.correct * 2) - (r.incorrect * (2 / 3));
+      qt.bestPercentage = Math.max(qt.bestPercentage, pct);
+    });
+
+    // Calculate avg % per quiz type
+    Object.values(quizTypeStats).forEach(qt => {
+      if (qt.count > 0) {
+        qt.avgPercentage = (qt.totalCorrect / (qt.totalCorrect + qt.totalIncorrect + (qt.totalMarks - qt.totalCorrect * 2 + qt.totalIncorrect * (2/3)))) * 100 || 0;
+      }
+    });
+
+    const testsGiven = results.length;
+    const avgPercentage = testsGiven > 0 ? sumPct / testsGiven : 0;
+
+    // Streak calculation (unchanged)
+    const sortedDates = [...dates].sort();
+    let currentStreak = 0;
+    let longestStreak = 0;
+    let prevDate = null;
+
+    for (const d of sortedDates) {
+      const curr = new Date(d);
+      if (prevDate) {
+        const diffDays = Math.round((curr - prevDate) / (1000 * 60 * 60 * 24));
+        if (diffDays === 1) currentStreak++;
+        else currentStreak = 1;
+      } else {
+        currentStreak = 1;
+      }
+      longestStreak = Math.max(longestStreak, currentStreak);
+      prevDate = curr;
+    }
+
+    res.json({
+      testsGiven,
+      totalCorrect,
+      totalIncorrect,
+      totalUnattempted,
+      totalTimeTakenSeconds: totalTime,
+      avgPercentage: Math.round(avgPercentage * 10) / 10,
+      bestPercentage: Math.round(bestPct * 10) / 10,
+      currentStreak,
+      longestStreak,
+      quizTypeStats,   // ← this is the new part!
+    });
+  } catch (err) {
+    console.error("/user/analytics/summary error:", err.message);
+    res.status(500).json({ message: "Failed to fetch analytics summary" });
+  }
+});
+
 // Get recent attempts (history)
 app.get("/user/analytics/attempts", userAuth, async (req, res) => {
   try {
